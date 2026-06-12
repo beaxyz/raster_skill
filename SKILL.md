@@ -119,25 +119,34 @@ try:
     from databricks.labs.gbx.rasterx import functions as rx
     rx.register(spark)
 
-    n = spark.sql("SHOW FUNCTIONS LIKE 'gbx_rst_*'").count()
-    print(f"✅ GeoBrix installed: {n} raster functions registered.")
-
-    # Inspect the actual Python API surface. Use ONLY names that appear in this output
-    # for any rx.<name>(...) call. Do not invent names (no read_raster, no load_tiff, etc.)
+    # AUTHORITATIVE signal — the Python API surface you actually call. Prefix-independent.
+    # Use ONLY names that appear here for any rx.<name>(...) call.
+    # Do not invent names (no read_raster, no load_tiff, etc.)
     api_names = sorted(name for name in dir(rx) if not name.startswith("_"))
-    print(f"\nrx.<...> API (use only these names):")
+    rst_fns = [n for n in api_names if n.startswith("rst_")]
+    print(f"✅ GeoBrix installed: {len(rst_fns)} rst_* functions on the Python API.")
+
+    # SQL registration check — the SQL prefix varies by version (`rst_*` or `rst_*`),
+    # so match EITHER with a contains-pattern. Do NOT hardcode one prefix: a wrong guess
+    # returns 0 silently and looks like "installed but empty".
+    n_sql = spark.sql("SHOW FUNCTIONS LIKE '*rst_*'").count()
+    print(f"   SQL functions registered (matching *rst_*): {n_sql}")
+
+    print("\nrx.<...> API (use only these names):")
     print(", ".join(api_names))
 except Exception as e:
     print(f"❌ GeoBrix not installed or misconfigured: {e}")
 ```
 
-**If functions are registered** → proceed to Phase 2.
+**If `rst_fns` is non-empty** → GeoBrix is installed, proceed to Phase 2. (The `dir(rx)` list is the source of truth; the SQL count is a secondary confirmation that registration also exposed the functions to Spark SQL.)
+
+**Determine the SQL prefix for THIS install before calling any function in SQL.** Don't assume either `gbx_rst_` or `rst_` — it varies by version. If you need the SQL names, print them: `spark.sql("SHOW FUNCTIONS LIKE '*rst_*'").show(truncate=False)` — and use exactly what it prints. In Python (the form this skill uses throughout), it's always `rx.rst_*`.
 
 **Hard rule on the API surface:**
 - `rx` exposes only the names printed above (typically `register` + `rst_<...>` functions).
 - **There is NO `rx.read_raster`, `rx.load_tiff`, `rx.from_path`, or any other "read" helper on the `rx` module.** Raster ingestion is always via `spark.read.format("gtiff_gdal" | "gdal").load(path)` (Phase 2b) or via the prescribed retile-and-persist pattern (Phase 2c). If you find yourself reaching for an `rx.read_*` or `rx.load_*` function, stop — it doesn't exist.
 - **For function details (signature, purpose, category) → read `references/functions.md`.** It's the curated catalog of every `rst_*` function organized by category (metadata, transformations, generators, H3 aggregation, etc.).
-- **DO NOT run `DESCRIBE FUNCTION EXTENDED gbx_rst_<name>` on each function** as a way to learn the API. It's slow (one SQL call per function), the output is Spark-formatted (not user-friendly), and the same information already lives in `references/functions.md`. The only valid use of `DESCRIBE FUNCTION EXTENDED` is debugging a specific signature mismatch at runtime.
+- **DO NOT run `DESCRIBE FUNCTION EXTENDED <name>` on each function** as a way to learn the API (and note the SQL name's prefix varies by version — see Phase 1b). It's slow (one SQL call per function), the output is Spark-formatted (not user-friendly), and the same information already lives in `references/functions.md`. The only valid use of `DESCRIBE FUNCTION EXTENDED` is debugging a specific signature mismatch at runtime.
 - If you're unsure whether a function exists or what it does, in order: (1) check the printed `api_names` list above, (2) grep `references/functions.md`, (3) if both miss, the function doesn't exist — don't invent it.
 
 **If the import or SQL check fails** on a classic cluster → the cluster needs bootstrap. See `references/install.md` for the full procedure (download artifacts → upload to UC Volume → configure init script + library on a classic DBR 17.1+ cluster).
@@ -155,9 +164,9 @@ Do not estimate the source size from the filename, the dataset name (e.g. "VIIRS
 The rule is about **timing, not syntax**. Do not emit any of these against the source path until Phase 2a has run and its output is in the conversation:
 
 - `spark.read.format("gtiff_gdal" | "gdal" | ...).load(source_path)` — the standard reader path
-- `spark.sql("SELECT * FROM gbx_rst_maketiles('...')")` or any **SQL TVF** that takes the file path
-- `rx.rst_fromfile(source_path)` / `gbx_rst_fromfile(source_path)` — direct constructor
-- `rx.rst_fromcontent(...)` / `gbx_rst_fromcontent(...)` reading from `binaryFile`-loaded bytes of the source
+- `spark.sql("SELECT * FROM rst_maketiles('...')")` or any **SQL TVF** that takes the file path
+- `rx.rst_fromfile(source_path)` / `rst_fromfile(source_path)` — direct constructor
+- `rx.rst_fromcontent(...)` / `rst_fromcontent(...)` reading from `binaryFile`-loaded bytes of the source
 - Any other GeoBrix function that takes a file path / URI to the source
 - Any `dbutils.fs.head` / `binaryFile` / `spark.read.format("binaryFile")` of the source (these read bytes too)
 
@@ -166,33 +175,62 @@ The only operation allowed against the source path before Phase 2a runs is **`db
 #### Phase 2a. Size check (MANDATORY first action)
 
 ```python
-items = dbutils.fs.ls(source_path)  # works on single file or directory
+items = dbutils.fs.ls(source_path)  # works on single file or directory; metadata only, no byte read
+
+# --- Detect format FIRST. The byte-based size check below is a SINGLE-GRID (GeoTIFF)
+#     heuristic: it assumes bytes ≈ pixels ≈ how hard this is to process. That assumption
+#     is FALSE for NetCDF/GRIB/HDF (variables-as-subdatasets, multidimensional:
+#     vars × time × level × grid), so routing MUST branch on format before measuring size.
+def _ext(path):
+    leaf = path.rstrip("/").rsplit("/", 1)[-1].lower()
+    return leaf.rsplit(".", 1)[-1] if "." in leaf else ""
+
+leaf = source_path.rstrip("/").rsplit("/", 1)[-1]
+exts = {_ext(source_path)} if "." in leaf else {_ext(i.path) for i in items}  # file → its ext; dir → contents' exts
+exts.discard("")
+SUBDATASET_EXTS = {"nc", "nc4", "grib", "grib2", "grb", "hdf", "hdf5", "h5"}
+is_subdataset_fmt = bool(exts & SUBDATASET_EXTS)
 
 total_bytes = sum(item.size for item in items)
 total_gb = total_bytes / (1024**3)
 n_files = len(items)
+print(f"{n_files} file(s), total {total_gb:.2f} GB; format(s): {sorted(exts) or ['unknown']}")
 
-if n_files == 1:
-    print(f"Single file: {total_gb:.2f} GB")
-    avg_mb = total_gb * 1024
+if is_subdataset_fmt:
+    # NetCDF/GRIB/HDF — bytes ≠ spatial size. Do NOT byte-route; do NOT spatially retile the raw file.
+    routing = "SUBDATASET"
+    print("\n*** ROUTING: SUBDATASET (NetCDF/GRIB/HDF) ***")
+    print("Byte-based LARGE/SMALL does NOT apply — bigness is logical (vars × time × level),")
+    print("not GB on disk. GeoBrix officially supports GeoTIFF only; NetCDF/GRIB are best-effort.")
+    print("Go to Phase 2d: enumerate subdatasets -> select variable/time -> subset ->")
+    print("write GeoTIFF/COG -> re-run THIS size check on that GeoTIFF output.")
 else:
-    avg_mb = total_bytes / n_files / (1024**2)
-    print(f"{n_files} files, total {total_gb:.2f} GB, avg {avg_mb:.1f} MB/file")
+    # Single-grid rasters (GeoTIFF/COG, JP2, IMG): bytes ≈ pixels, the heuristic holds.
+    if n_files == 1:
+        print(f"Single file: {total_gb:.2f} GB")
+        avg_mb = total_gb * 1024
+    else:
+        avg_mb = total_bytes / n_files / (1024**2)
+        print(f"avg {avg_mb:.1f} MB/file")
 
-# Routing decision — print loud and clear so the human and the LLM both see it
-if total_gb > 5:
-    print("\n*** ROUTING: LARGE ***")
-    print("MUST use the 'Pattern: Large raster ingestion' below.")
-    print("MUST NOT write any spark.read.format(...).load(source_path) call against the source.")
-elif n_files > 100 and avg_mb > 500:
-    print("\n*** ROUTING: LARGE (many large files) ***")
-    print("MUST use the retile-and-persist pattern.")
-else:
-    print("\n*** ROUTING: SMALL/MEDIUM ***")
-    print("Phase 2b standard read is appropriate.")
+    if total_gb > 5:
+        routing = "LARGE"
+        print("\n*** ROUTING: LARGE ***")
+        print("MUST use the retile-and-persist pattern in references/examples/large-raster-retile.md.")
+        print("MUST NOT write any spark.read.format(...).load(source_path) call against the source.")
+    elif n_files > 100 and avg_mb > 500:
+        routing = "LARGE"
+        print("\n*** ROUTING: LARGE (many large files) ***")
+        print("MUST use the retile-and-persist pattern.")
+    else:
+        routing = "SMALL/MEDIUM"
+        print("\n*** ROUTING: SMALL/MEDIUM ***")
+        print("Phase 2b standard read is appropriate.")
+
+print(f"\nRouting decision: {routing}")
 ```
 
-**After this cell runs, look at its output. The routing decision drives everything downstream.**
+**After this cell runs, look at its output. The routing decision drives everything downstream.** Note the detected format(s): if it prints `['unknown']` (e.g. extension-less files), inspect the source manually before assuming the single-grid path — a NetCDF/GRIB file without an extension will otherwise be byte-routed incorrectly.
 
 #### Hard rules — non-negotiable, no creative interpretation
 
@@ -209,11 +247,13 @@ else:
 
 4. **Thresholds are minimum-bars, not preferences.** When in doubt between standard read and retile-and-persist, choose retile-and-persist.
 
-5. **You must surface the routing decision to the human.** After Phase 2a runs, your next message should state: "Phase 2a routed this as [LARGE / SMALL-MEDIUM]. Proceeding with [retile-and-persist / standard read]." Do not silently transition.
+5. **You must surface the routing decision to the human.** After Phase 2a runs, your next message should state: "Phase 2a routed this as [LARGE / SMALL-MEDIUM / SUBDATASET]. Proceeding with [retile-and-persist / standard read / NetCDF subset-to-GeoTIFF]." Do not silently transition.
 
-#### Phase 2b. Standard read (SMALL/MEDIUM routing only)
+6. **If routing is SUBDATASET (NetCDF/GRIB/HDF), go to Phase 2d.** Do NOT apply the GB thresholds, do NOT spatially retile the raw file, and do NOT read it through Phase 2b/2c as if it were a single grid. The byte-based gate is a GeoTIFF heuristic and is meaningless here — the file's "size" is its logical shape (variables × timesteps × levels), which `dbutils.fs.ls` cannot see.
 
-**Only enter this section if Phase 2a printed `ROUTING: SMALL/MEDIUM`.** Otherwise, jump to Phase 2c.
+#### Phase 2b. Standard read (SMALL/MEDIUM routing only — single-grid formats)
+
+**Only enter this section if Phase 2a printed `ROUTING: SMALL/MEDIUM`.** That routing is reachable only for single-grid formats (GeoTIFF/COG, JP2, IMG). For LARGE jump to Phase 2c; for SUBDATASET (NetCDF/GRIB/HDF) jump to Phase 2d.
 
 Pick the reader based on the source extension:
 
@@ -221,13 +261,11 @@ Pick the reader based on the source extension:
 ext = source_path.lower().rsplit(".", 1)[-1]
 
 if ext in ("tif", "tiff"):
-    rasters = spark.read.format("gtiff_gdal").load(source_path)
-elif ext == "nc":
-    rasters = spark.read.format("gdal").option("driverName", "NetCDF").load(source_path)
-elif ext in ("grib", "grib2"):
-    rasters = spark.read.format("gdal").option("driverName", "GRIB").load(source_path)
+    rasters = spark.read.format("gtiff_gdal").load(source_path)   # GeoTIFF / COG
 else:
-    # Let GDAL auto-detect from extension
+    # Other single-grid GDAL formats — auto-detect, or set driverName explicitly
+    # (e.g. "JP2OpenJPEG" for .jp2, "HFA" for .img).
+    # NOTE: NetCDF/GRIB are NOT read here — they route to Phase 2d.
     rasters = spark.read.format("gdal").load(source_path)
 
 # Optional: split per-file at a target size. Add only if files are several hundred MB+.
@@ -238,14 +276,29 @@ The output has a `tile` column ready for RasterX functions. Proceed to Phase 3.
 
 #### Phase 2c. LARGE routing → retile-and-persist
 
-If Phase 2a printed `ROUTING: LARGE`, skip Phase 2b and jump to **Pattern: Large raster ingestion** later in this doc. That pattern is the single source of truth for LARGE sources; it handles read + inspect + auto-sized retile + Delta persist, and feeds downstream phases from the persisted table.
+If Phase 2a printed `ROUTING: LARGE`, skip Phase 2b and follow the **retile-and-persist pattern** in `references/examples/large-raster-retile.md` — the path for LARGE **single-grid** rasters (GeoTIFF/COG, `.jp2`, `.img`). It handles read + inspect + auto-sized retile + Delta persist, and feeds downstream phases from the persisted table. **NetCDF/GRIB are out of scope for that pattern** — they expose variables as subdatasets and their CRS may need checking (sometimes inferred from CF metadata, sometimes absent), so their read + metadata steps differ before any retile.
+
+#### Phase 2d. SUBDATASET routing → NetCDF / GRIB / HDF
+
+If Phase 2a printed `ROUTING: SUBDATASET`, the byte-based size gate does **not** apply and you must **not** feed the raw file into Phase 2b/2c. These formats expose multiple **variables as subdatasets** and are often multidimensional (`time × level × lat × lon`); their CRS may be inferred from CF metadata or absent (check `rst_srid`, don't assume).
+
+> ⚠️ **GeoBrix officially supports GeoTIFF only** (per its readers list — see Resources). NetCDF/GRIB are best-effort via the generic GDAL driver, with no guarantees. The robust path is to reduce them to GeoTIFFs and then use the supported single-grid flow. Because support is best-effort, falling back to a NetCDF-native tool (xarray / rioxarray) for the *extraction* step is more legitimate here than it would be for GeoTIFF — but still surface the choice to the user per the substitution policy.
+
+**Strategy (don't byte-route, don't spatially retile the raw file):**
+
+1. **Enumerate subdatasets / variables** — `rx.rst_subdatasets("tile")` (or `gdalinfo` / xarray) to see the variables and their dimensions. The "size" that matters is the *logical shape* — how many variables × timesteps × levels, at what per-slice grid — not GB on disk.
+2. **Select** the variable(s) and time/level slice(s) you actually need; drop the rest. This is usually where the real data-volume reduction happens.
+3. **Subset / rechunk** the selected slices. Two viable outputs (the worked example uses the second): convert to GeoTIFF/COG and re-enter the single-grid flow, **or** rechunk to smaller `.nc` files with xarray and read them directly with `driverName="netCDF"`.
+4. **Analyse** — check `rx.rst_srid("tile")` first (GDAL often infers the CRS from CF metadata; if it's genuinely `0`, ask the user for the EPSG — don't hardcode). Align to your boundary's CRS with `rx.rst_transform` before clip/H3. Bands map to **timesteps**, not spectral bands.
+
+**Worked example: `references/examples/netcdf-ingest.md`** — full two-scenario flow (one big `.nc` → rechunk by a variable → analyse chunked files), with the CRS check/align step, hourly-band explode, clip-to-city, and H3 time-series.
 
 #### Anti-patterns — DO NOT EMIT THESE for LARGE sources
 
 | Anti-pattern | Why it's wrong |
 |---|---|
 | `spark.read.format("gtiff_gdal").load(huge_file)` | Reads the giant file, often multiple times. The MB-bounded split is not a substitute for retile-and-persist. |
-| `SELECT * FROM gbx_rst_maketiles('{huge_file}', ...)` as the ingest step | `rst_maketiles` is a **generator** (build tiles from an extent + grid definition), not a file-ingest function. Using it to ingest a TIFF is either a misuse or a workaround for the size-check gate. Use the prescribed read pattern (small/medium) or retile-and-persist (large). |
+| `SELECT * FROM rst_maketiles('{huge_file}', ...)` as the ingest step | `rst_maketiles` is a **generator** (build tiles from an extent + grid definition), not a file-ingest function. Using it to ingest a TIFF is either a misuse or a workaround for the size-check gate. Use the prescribed read pattern (small/medium) or retile-and-persist (large). |
 | `rst_fromfile(huge_file)` as the entry point | Same family as the SQL TVF above — a "direct constructor" that bypasses the size-check gate. Allowed only after Phase 2a routes the source as SMALL/MEDIUM. |
 | Read source twice (e.g. once for metadata, once for clipping) | Every downstream op re-pays the GDAL split cost. After Phase 2a, the next source read must be the one that persists to Delta. |
 | Read source → filter tiles by `rst_boundingbox` ∩ target bbox → clip survivors → merge | Still reads the giant source on every run. The "smart spatial filter" doesn't help; the cost is in the read, not the clip. Retile-and-persist instead. |
@@ -256,7 +309,7 @@ If Phase 2a printed `ROUTING: LARGE`, skip Phase 2b and jump to **Pattern: Large
 
 ### Phase 3: Process
 
-Register functions, then operate on the `tile` column with whatever operations the user's workflow needs. **None of the operations below are required** — pick the ones that fit. Many raster workflows have no clip step at all (global aggregation, reprojection, format conversion, mosaic). Don't assume "clip to a region" is the default just because it's a common example.
+**Phase 3 is format-agnostic.** Phases 2b/2c/2d all converge on a `tile` column; from here the analytics are the same whether the source was a GeoTIFF, a retiled large scene, or a NetCDF reduced to GeoTIFFs. Register functions, then operate on the `tile` column with whatever operations the user's workflow needs. **None of the operations below are required** — pick the ones that fit. Many raster workflows have no clip step at all (global aggregation, reprojection, format conversion, mosaic). Don't assume "clip to a region" is the default just because it's a common example.
 
 ```python
 from databricks.labs.gbx.rasterx import functions as rx
@@ -286,11 +339,18 @@ reproj = rasters.select(rx.rst_transform("tile", lit(3857)).alias("tile"))
 
 # Vegetation index — NDVI for a multi-band scene (red=1, nir=2 for Sentinel-2).
 ndvi = rasters.select(rx.rst_ndvi("tile", lit(1), lit(2)).alias("ndvi"))
+
+# H3 — tessellate/aggregate pixels to hex cells.
+# Unpacking depends on what a "band" is (single-band [0] vs spectral vs NetCDF timesteps).
+# See references/examples/h3-examples.md for the example types + function list.
 ```
 
-The right Phase 3 operations depend entirely on the user's workflow. Ask if it's not stated; don't reach for clip-to-polygon by default.
+The snippets above are a quick taste. The worked, format-agnostic analytics live in dedicated docs (they run on the `tile` column from any ingestion route):
 
-See `references/functions.md` for the full function catalog.
+- `references/examples/raster-analytics.md` — per-band stats (incl. multi-temporal), clip to a boundary polygon, zonal stats
+- `references/examples/h3-examples.md` — H3 tessellate / aggregate / time-series, the band-semantics matrix, function list
+
+The right Phase 3 operations depend entirely on the user's workflow. Ask if it's not stated; don't reach for clip-to-polygon by default. See `references/functions.md` for the full function catalog.
 
 ### Phase 4: Persist
 
@@ -314,165 +374,11 @@ output_table = "${catalog}.${schema}.${table_name}"  # confirmed with user
 
 Apply the same propose-and-confirm pattern wherever a table name is needed (`retiled_table` in the large-raster pattern, intermediate Delta tables, etc.).
 
-## Pattern: Large raster ingestion (retile-and-persist)
-
-**This is where Phase 2c routes when the size check in 2a flags the source as LARGE** — global scenes, multi-band imagery, or anything where the input is more than ~5–10 GB. The standard Phase 2 → Phase 3 flow (read, operate, write) doesn't scale well to global-coverage rasters because every downstream op re-reads the source. For scenes like VIIRS / Landsat / Sentinel mosaics, **read → retile → persist → operate** is the production pattern.
-
-### Why the simple pattern fails at scale
-
-| Symptom | Cause |
-|---|---|
-| First operation hangs for many minutes | GDAL has to scan and split the giant file every time |
-| Driver OOM on metadata extraction | Catalog enumeration over many splits in a single call |
-| Downstream ops re-read the source TIFF | Without persisting, Spark recomputes the split for each transform |
-| Long tail on a few executors | `sizeInMB=16` splits are MB-bounded, not pixel-bounded — uneven tile shapes |
-
-### Step-by-step
-
-```python
-import math
-from pyspark.sql import functions as F
-from databricks.labs.gbx.rasterx import functions as rx
-rx.register(spark)
-
-tiff_path = "${tiff_path}"
-retiled_table = "${catalog}.${schema}.retiled_raster"
-
-# 1. Read the raster — explicit driver. The reader splits the file by `sizeInMB` (default 16)
-#    so each row in `raster_df` represents one CHUNK, not the whole file.
-raster_df = (
-    spark.read.format("gdal")
-        .option("driverName", "GTiff")
-        .load(tiff_path)
-)
-
-# 2. Inspect TRUE source dimensions.
-#    ⚠️ CRITICAL: `rx.rst_width("tile")` on a single row returns the CHUNK's width,
-#    not the source file's width. DO NOT use `.limit(1).collect()` for sizing —
-#    you'd be sizing tiles to the chunk, not the file, and downstream retile would
-#    produce thousands of tiny tiles instead of ~200.
-#
-#    Use ONE of the two methods below to get true full-file dimensions.
-
-# --- Option A (preferred — rasterio for metadata only) ---
-# rasterio reads the GTiff/NetCDF/etc. header without scanning pixel data, returning
-# true file dimensions instantly. This is a LEGITIMATE use of rasterio (metadata-only
-# header read) and is an accepted exception to the substitution policy because
-# GeoBrix still does the heavy work (the retile + persist + all downstream Spark ops).
-# Empirically faster than the GeoBrix aggregation alternative on most clusters,
-# because it's a single header read on the driver instead of a distributed UDF pass.
-import rasterio
-with rasterio.open(tiff_path) as src:
-    width, height = src.width, src.height
-    bands = src.count
-    srid = src.crs.to_epsg() if src.crs else None
-print(f"Full raster: {width} × {height} px, {bands} band(s), EPSG:{srid}")
-
-# --- Option B (alternative — GeoBrix-only single-pass aggregation) ---
-# If you need to avoid rasterio entirely (e.g., it's not installed, or the source
-# format isn't well-supported by rasterio), use this aggregation pattern:
-# union per-chunk extents to reconstruct the file extent. Mathematically correct
-# but typically slower than Option A because it runs UDFs on every chunk.
-# Note: `pixelheight` is NEGATIVE for north-up rasters; the ymin formula handles
-# the sign correctly via (uly + chunk_h * px_h).
-#
-# full_extent = raster_df.select(
-#     rx.rst_upperleftx("tile").alias("ulx"),
-#     rx.rst_upperlefty("tile").alias("uly"),
-#     rx.rst_width("tile").alias("chunk_w"),
-#     rx.rst_height("tile").alias("chunk_h"),
-#     rx.rst_pixelwidth("tile").alias("px_w"),
-#     rx.rst_pixelheight("tile").alias("px_h"),
-#     rx.rst_numbands("tile").alias("bands"),
-#     rx.rst_srid("tile").alias("srid"),
-# ).select(
-#     F.min("ulx").alias("xmin"),
-#     F.max(F.col("ulx") + F.col("chunk_w") * F.col("px_w")).alias("xmax"),
-#     F.min(F.col("uly") + F.col("chunk_h") * F.col("px_h")).alias("ymin"),
-#     F.max("uly").alias("ymax"),
-#     F.first("px_w").alias("px_w"),
-#     F.first("px_h").alias("px_h"),
-#     F.first("bands").alias("bands"),
-#     F.first("srid").alias("srid"),
-# ).collect()[0]
-# width  = int(round((full_extent.xmax - full_extent.xmin) / full_extent.px_w))
-# height = int(round((full_extent.ymax - full_extent.ymin) / abs(full_extent.px_h)))
-# bands, srid = full_extent.bands, full_extent.srid
-#
-# Do NOT use `rst_width` from a single chunk row — that's the bug this section
-# exists to prevent.
-
-# 3. Derive tile size from raster shape — DO NOT hardcode.
-#    Target a total tile count that parallelizes well without overhead bloat.
-#    Rule of thumb: 100-500 total tiles is a reasonable range for most clusters.
-target_total_tiles = 200
-ideal_tile_px = int(math.sqrt((width * height) / target_total_tiles))
-
-# Round to a common tile size in the [512, 16384] range for memory predictability
-common_sizes = [512, 1024, 2048, 4096, 8192, 16384]
-tile_size = min(common_sizes, key=lambda s: abs(s - ideal_tile_px))
-estimated_tiles = math.ceil(width / tile_size) * math.ceil(height / tile_size)
-print(f"Tile size: {tile_size} × {tile_size}, estimated ~{estimated_tiles} tiles")
-
-# 4. Retile + persist to Delta. The persist step is what makes downstream cheap —
-#    every later op reads the materialized tiles, not the giant TIFF.
-retiled_df = raster_df.withColumn(
-    "retiled", rx.rst_retile("tile", F.lit(tile_size), F.lit(tile_size))
-)
-retiled_df.write.mode("overwrite").saveAsTable(retiled_table)
-
-# 5. Read back from the persisted table for ALL downstream work
-tiles = (
-    spark.read.table(retiled_table)
-    .drop("tile")
-    .withColumnRenamed("retiled", "tile")
-)
-```
-
-### Tuning tile size
-
-The auto-derived size targets ~200 total tiles. Override `target_total_tiles` if you have specific needs:
-
-| Trade-off | Increase target tiles | Decrease target tiles |
-|---|---|---|
-| Parallelism | More tiles, more parallel work | Fewer tiles, less parallel |
-| Per-tile work | Smaller tiles, less work each | Larger tiles, more work each |
-| File / metadata overhead | More files in Delta, higher overhead | Fewer files, less overhead |
-| Memory per tile | Lower (smaller tile fits comfortably) | Higher (large tile may OOM) |
-
-For a cluster with ~4 workers, ~200 tiles gives each worker ~50 tiles — a good default. Tune higher (500+) for very large clusters; tune lower (100) if per-tile ops are expensive.
-
-### Aggregating tiles to H3 (with `[0]` band-index gotcha)
-
-`rst_h3_rastertogridavg` returns an **array-of-arrays**: one array per band, each containing `(cellID, measure)` tuples. For single-band rasters (VIIRS DNB, DTM, single-channel imagery), index `[0]` to pick band 1 before exploding:
-
-```python
-h3_resolution = 8  # tune for the workload; ~0.7 km² per cell at res 8
-
-h3_df = (
-    tiles
-    .withColumn("h3_stats", rx.rst_h3_rastertogridavg("tile", F.lit(h3_resolution)))
-    .select(F.explode(F.col("h3_stats")[0]).alias("c"))   # [0] = band 1
-    .select(
-        F.col("c.cellID").alias("h3_cell"),
-        F.col("c.measure").alias("mean_value"),            # rename to match the source semantic (e.g. mean_elevation, mean_radiance, mean_temp)
-    )
-)
-```
-
-For multi-band rasters, loop over `[band_index]` and union/concat the results, or explode each separately with a band-label column.
-
-### When NOT to use this pattern
-
-- Small rasters (< 1 GB) — the persist-to-Delta overhead isn't worth it. Stick to the standard Phase 2–4 flow.
-- Single-tile operations (one polygon, one zonal stat) — the metadata-then-clip path is faster.
-- Truly streaming workloads — this pattern is batch-oriented; for continuous ingest, you'd structure differently.
-
 ## Common Issues
 
 | Issue | Cause / Fix |
 |---|---|
-| `SHOW FUNCTIONS LIKE 'gbx_rst_*'` returns empty | Init script didn't run — check cluster event log, verify `VOL_DIR` and Volume path |
+| `SHOW FUNCTIONS LIKE '*rst_*'` returns empty (but `dir(rx)` shows `rst_*`) | Registration didn't expose SQL functions — re-run `rx.register(spark)`; if `dir(rx)` is also empty, the init script didn't run (check cluster event log, verify `VOL_DIR` and Volume path) |
 | `UnsatisfiedLinkError: libgdalalljni.so` | `.so` not copied to `/usr/lib/` — re-check init script |
 | `Driver not found` on read | Provide `driverName` option, or use a named reader (`gtiff_gdal`) |
 | Out-of-memory on large rasters | Increase `sizeInMB` split, or use `rx.rst_retile` to chunk |
@@ -483,6 +389,10 @@ For multi-band rasters, loop over `[band_index]` and union/concat the results, o
 ### References
 - `references/install.md` — Detailed cluster setup, init script content, troubleshooting
 - `references/functions.md` — Full RasterX function reference (metadata, transformations, generators, H3 aggregation)
+- `references/examples/large-raster-retile.md` — Large **single-grid** raster (LARGE routing) retile-and-persist pattern for GeoTIFF/COG, `.jp2`, `.img`: read → inspect true dimensions → auto-sized retile → Delta persist → H3 aggregation (NetCDF/GRIB out of scope)
+- `references/examples/netcdf-ingest.md` — NetCDF/GRIB (SUBDATASET routing) two-scenario flow: rechunk one big `.nc` by a variable (xarray), then analyse chunked files with GeoBrix — CRS check/align, hourly-band explode, clip-to-city, H3 time-series
+- `references/examples/raster-analytics.md` — **Phase 3, format-agnostic** analytics on a `tile` column: summary metadata, per-band stats (incl. multi-temporal `band_index → timestamp`), clip to a boundary polygon, zonal stats
+- `references/examples/h3-examples.md` — **Phase 3, format-agnostic** H3 example types on a `tile` column: tessellate, aggregate per cell, multi-temporal time-series, coarse-grid pre-retile, region filtering/rendering; band-semantics matrix + function list
 
 ### External
 - Docs: https://databrickslabs.github.io/geobrix/

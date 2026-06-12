@@ -1,0 +1,135 @@
+# H3 examples (Phase 3, format-agnostic)
+
+H3 puts raster pixel values onto a uniform hexagonal grid — useful for joining rasters to other H3-indexed data, aggregating to comparable cells, and web maps. Everything here runs on a `tile` column from **any** ingestion route (Phase 2b/2c/2d).
+
+The sections below explain each function: **what it does, when to use it, and which parameters are yours to choose.** Compose them as your workflow needs — every literal value shown (resolution, sub-tile size, region, CRS) is an example, not a requirement. Any clipping or reprojection you need first is in `raster-analytics.md`; H3 doesn't require it.
+
+```python
+from databricks.labs.gbx.rasterx import functions as rx
+import pyspark.sql.functions as F
+rx.register(spark)
+```
+
+## First: what a "band" is — how to unpack any `rst_h3_*` result
+
+Every `rst_h3_*` function returns an **array-of-arrays**: one inner array **per band**, each holding `(cellID, measure)` tuples. How you unpack it depends entirely on what the bands represent in *your* raster — a property fixed at ingestion:
+
+| Bands represent | Example sources | Unpack |
+|---|---|---|
+| One channel | DTM, single-channel imagery | `[0]`, then `explode` |
+| Spectral bands | Sentinel/Landsat | `posexplode` and keep the band index as a label |
+| Timesteps (or levels) | NetCDF, time-stacked GeoTIFF | `posexplode` **all** bands, then map the band index to time |
+
+Indexing `[0]` on a multi-band/temporal raster silently keeps only the first band — the most common mistake here.
+
+**Don't guess — check the band count first.** It's cheap metadata, and it picks the mechanics for you:
+
+```python
+nbands = tiles.select(rx.rst_numbands("tile")).first()[0]
+print(f"{nbands} band(s)")
+```
+
+- `nbands == 1` → single-band: the `[0]` + `explode` shortcut.
+- `nbands > 1` → multi-band: the two-step `posexplode` + `explode` (below).
+
+The count decides single vs multi (the *mechanics*). What `band_index` then *means* — a spectral channel vs a timestep/level — comes from knowing the source (established at ingestion), per the table above.
+
+## `rst_h3_rastertogridavg` — aggregate pixel values per H3 cell
+
+**What:** assigns every pixel to an H3 cell at a chosen resolution and returns the mean value per cell. Variants: `rst_h3_rastertogridcount` (pixels per cell), `…max`, `…min`, `…median`.
+
+**When:** you want raster values on the H3 grid — to join with other H3 data, compare regions on equal-area cells, or drive a hex map.
+
+```python
+res = 8                       # YOUR choice — see "Choosing a resolution" below
+agg = tiles.withColumn("h3", rx.rst_h3_rastertogridavg("tile", F.lit(res)))
+
+# Unpack per the band table above. Single-band example:
+cells = (agg
+    .select(F.explode(F.col("h3")[0]).alias("c"))      # [0] = the only band
+    .select(F.col("c.cellID").alias("h3_cell"),
+            F.col("c.measure").alias("value")))         # rename to your semantic: mean_elevation, mean_temp, …
+```
+
+**Multi-band — the two-step explode.** Because the result is an array (bands) of arrays (cells), any multi-band raster unpacks the same way: **`posexplode` the outer array → one row per band (`band_index`); then `explode` the inner array → one row per cell.** This single pattern covers *both* multi-band cases — only the meaning of `band_index` changes (a spectral channel, or a timestep). Single-band is just the shortcut `[0]` + one `explode`.
+
+Spectral example (keep the channels apart):
+
+```python
+cells = (agg
+    .select(F.posexplode("h3").alias("band_index", "cells"))   # step 1: one row per band
+    .select("band_index", F.explode("cells").alias("c"))       # step 2: one row per cell
+    .select("band_index", F.col("c.cellID").alias("h3_cell"), F.col("c.measure").alias("value")))
+# join band_index → band name as needed
+```
+
+For a temporal stack it's the **identical** two steps — you just map `band_index → timestamp` instead of a channel name (see "Temporal stacks" below).
+
+## Choosing a resolution
+
+`resolution` sets the H3 cell size; it is a **choice**, not fixed. Higher = smaller cells = more rows. Rough areas: res 6 ≈ 36 km², res 7 ≈ 5 km², res 8 ≈ 0.7 km², res 9 ≈ 0.1 km². Match it to your raster's pixel size and the granularity your analysis needs — going much finer than the pixel size just interpolates; much coarser discards detail.
+
+## `rst_tooverlappingtiles` — split tiles before aggregation (when the grid is coarse)
+
+**What:** cuts each tile into smaller, optionally overlapping sub-tiles. Signature `(tile, width, height, overlap)` — all in pixels.
+
+**When / why:** H3 aggregation samples *pixels* into cells. If the raster grid is **coarse relative to your H3 resolution** — e.g. a global climate grid at 0.25° feeding res-7 cells — each cell may capture only one pixel or none, giving sparse or empty results. Splitting into small sub-tiles raises the effective sampling so cells get populated. **Skip it for fine imagery**, where each cell already covers many pixels; it only adds rows.
+
+```python
+# width/height/overlap are all YOUR choice. Smaller sub-tiles = denser sampling but more rows.
+# overlap > 0 softens edge artifacts between sub-tiles; 0 = no overlap.
+tiles = tiles.withColumn("tile", rx.rst_tooverlappingtiles("tile", F.lit(64), F.lit(64), F.lit(0)))
+```
+
+There's no universal size — start near your tile's native block size and shrink if cells come back empty.
+
+## Temporal stacks — mapping bands to time
+
+When bands are timesteps, `posexplode` **all** of them; `band_index` is the step ordinal (0, 1, 2…). Convert it to a real timestamp using **however your data encodes time** — the mapping is yours, not a fixed formula:
+
+```python
+exploded = (agg
+    .select(F.posexplode("h3").alias("band_index", "cells"))   # band_index = step ordinal
+    .select("band_index", F.explode("cells").alias("c"))
+    .select("band_index", F.col("c.cellID").alias("h3_cell"), F.col("c.measure").alias("value")))
+
+# Then turn band_index into time per your data, e.g.:
+#   • bands are hours within a day  → timestampadd(HOUR, band_index, <day>)
+#   • bands are daily steps from t0 → timestampadd(DAY,  band_index, <t0>)
+#   • bands carry their own time var → join band_index to a step→time lookup you build at ingestion
+```
+
+Filtering empty/nodata cells is optional — e.g. `.where(F.col("value") != <nodata>)` or drop empty tiles upstream with `rst_isempty`. Use it only if your raster has a meaningful nodata value.
+
+## `rst_h3_tessellate` — raster → H3 cells with geometry
+
+**What:** maps the raster onto H3 cells returning cell geometry/coverage, not just an aggregate value.
+
+**When:** you need the cell shapes (e.g. to render or to do further geometry work), rather than one statistic per cell.
+
+```python
+res = 8   # your choice
+tessellated = tiles.withColumn("h3", rx.rst_h3_tessellate("tile", F.lit(res)))
+```
+
+## Restrict to a region & render (native DBSQL H3)
+
+These native functions complement the GeoBrix ones and work on the `cellID`s you produced:
+
+- `h3_polyfillash3(<boundary_wkt>, res)` → the cells covering any boundary; join/filter your results to a region of interest (the boundary is whatever you choose — not tied to any specific place)
+- `h3_h3tostring(cellID)` → hex-string ID for joins / display
+- `h3_celltoboundary(cellID)` → cell polygon for map rendering
+
+For a quick map, reduce to one slice (e.g. a single timestamp), apply any unit conversion your data needs, then render a deck.gl `H3HexagonLayer` via `displayHTML`. Keep the row count small with a `WHERE` filter before `toPandas()`.
+
+## Functions (reference)
+
+| Function | Purpose |
+|---|---|
+| `rst_h3_rastertogridavg(tile, res)` | Mean per cell |
+| `rst_h3_rastertogridcount(tile, res)` | Pixel count per cell |
+| `rst_h3_rastertogridmax / min / median(tile, res)` | Other per-cell stats |
+| `rst_h3_tessellate(tile, res)` | Map raster onto H3 cells (geometry) |
+| `rst_tooverlappingtiles(tile, w, h, overlap)` | Split into sub-tiles before aggregation (coarse grids) |
+
+All `rst_h3_*` return the array-per-band shape — unpack per the table at the top.

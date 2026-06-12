@@ -1,6 +1,6 @@
 # RasterX Function Reference
 
-All RasterX functions operate on a `tile` column (raster type) and are prefixed `gbx_rst_` in SQL or accessed as `rx.rst_*` after `rx.register(spark)`.
+All RasterX functions operate on a `tile` column (raster type). In **Python** (the form this skill uses throughout) they're accessed as `rx.rst_*` after `rx.register(spark)`. The **SQL** prefix is version-dependent — `gbx_rst_*` per the docs, but some installs register them as bare `rst_*`; confirm with `SHOW FUNCTIONS LIKE '*rst_*'` before calling them in SQL. This catalog lists the bare `rst_*` names.
 
 ```python
 from databricks.labs.gbx.rasterx import functions as rx
@@ -77,7 +77,7 @@ Authoritative API reference: https://databrickslabs.github.io/geobrix/docs/api/r
 | `rst_separatebands(tile)` | Explode multi-band tile into one row per band |
 | `rst_retile(tile, size)` | Retile to a specified pixel size |
 | `rst_maketiles(extent, grid)` | Build tiles from a grid definition |
-| `rst_tooverlappingtiles(tile, size, overlap)` | Tile with overlap (for edge-aware ops) |
+| `rst_tooverlappingtiles(tile, width, height, overlap)` | Tile with overlap (for edge-aware ops, and to give a coarse grid enough cells before H3). Four args: e.g. `rx.rst_tooverlappingtiles("tile", F.lit(32), F.lit(32), F.lit(0))`. |
 | `rst_h3_tessellate(tile, resolution)` | Tessellate raster into H3 cells |
 
 ## H3 grid aggregation
@@ -108,7 +108,7 @@ For `spark.read.format("gdal")` or named readers (`gtiff_gdal`, etc.):
 
 | Option | Default | Purpose |
 |---|---|---|
-| `driverName` | inferred from extension | Force GDAL driver (e.g. `GTiff`, `NetCDF`, `GRIB`) |
+| `driverName` | inferred from extension | Force GDAL driver. Use GDAL's canonical short names: `GTiff`, `netCDF` (lowercase `n`/`C` — not `NetCDF`), `GRIB` |
 | `sizeInMB` | `16` | Split files over this threshold during read |
 | `filterRegex` | `.*` | Filter input paths by regex |
 
@@ -125,6 +125,6 @@ For `spark.read.format("gdal")` or named readers (`gtiff_gdal`, etc.):
 
 ## Notes
 
-- Functions are also callable directly in Spark SQL with the `gbx_` prefix: `SELECT gbx_rst_width(tile) FROM rasters`
+- Functions are also callable directly in Spark SQL, but the prefix is version-dependent (`gbx_rst_*` per docs, `rst_*` on some installs). Verify with `SHOW FUNCTIONS LIKE '*rst_*'`, then call e.g. `SELECT <prefix>rst_width(tile) FROM rasters`
 - After ingestion via vector readers (`*_ogr`), output uses `geom_0` / `geom_0_srid` / `geom_0_srid_proj` columns (or `shape*` / `SHAPE*` depending on the reader). Convert to native UC `GEOMETRY`/`GEOGRAPHY` types as a downstream step if needed
 - For functions not listed here, check the latest API at https://databrickslabs.github.io/geobrix/docs/packages/rasterx
