@@ -1,11 +1,24 @@
-# GeoBrix Cluster Setup
+# GeoBrix Heavyweight Install
 
-Complete steps to install GeoBrix on a Databricks classic cluster.
+GeoBrix has two **execution tiers** ([Choosing an Execution Tier](https://databrickslabs.github.io/geobrix/docs/api/execution-tiers/)). Pick one before proceeding:
 
-## Prerequisites
+| Tier | Install doc | Compute | When |
+|---|---|---|---|
+| **Lightweight** (`pyrx`) — **default** | [`references/install-light.md`](install-light.md) | Serverless (preferred), classic shared/ARM/dedicated | Most raster tasks; `%pip [light]` wheel only |
+| **Heavyweight** (`rasterx`) | [`references/install-heavy.md`](install-heavy.md) — steps below | Classic **x86** only | OGR readers, exotic GDAL options, PMTiles writer, existing JAR+init setup, or `pyrx` unavailable |
+
+**Defaults:** tier = Lightweight; compute = Serverless (classic only when Serverless unavailable). See `SKILL.md` → Execution tier selection.
+
+---
+
+# Heavyweight Install (classic x86)
+
+Complete steps to install GeoBrix **Heavyweight** on a classic x86 cluster (JAR + GDAL init script + WHL).
+
+## Heavyweight prerequisites
 
 - **DBR 17.1 or later** (LTS preferred). Older runtimes lack native spatial types GeoBrix interoperates with.
-- **Classic compute** — Serverless clusters are NOT supported. GeoBrix needs cluster-level init scripts and JAR installation.
+- **Classic x86 compute** — Heavyweight does not run on Serverless or ARM. Use [`install-light.md`](install-light.md) for Serverless.
 - **UC Volume** with write access — hosts the JAR, `.so`, init script, and WHL artifacts.
 - **Cluster permissions** to attach init scripts and upload libraries (`CAN MANAGE` on the cluster).
 
@@ -60,8 +73,9 @@ mode_map = {
 access_mode = mode_map.get(cluster_profile, cluster_profile)
 
 if not cluster_id:
-    print("❌ Not on a classic cluster. GeoBrix requires classic All-Purpose / Job compute.")
-    print("   Fix: click the Connect dropdown at the top right of the notebook and pick a classic cluster.")
+    print("❌ Not on a classic cluster — required for Heavyweight install.")
+    print("   For Serverless / Lightweight tier, use references/install-light.md instead.")
+    print("   For Heavyweight: click Connect and pick a classic x86 All-Purpose / Job cluster.")
 else:
     print(f"✅ Attached to a classic cluster")
     print(f"   Cluster ID:  {cluster_id}")
@@ -130,7 +144,7 @@ Only run this after the user confirms (c) and confirms they have metastore admin
 - If install completes but `rx.register(spark)` fails later, the access mode is the first thing to check.
 - The Shared-mode allowlist friction has bitten multiple users — naming it upfront avoids a half-finished install.
 
-**If Check 1 fails (no `cluster_id`):** click the **Connect** dropdown at the top right of the notebook and pick a classic cluster (not Serverless, not a SQL warehouse). The remaining checks won't be meaningful until this passes.
+**If Check 1 fails (no `cluster_id`):** you are on Serverless or no compute is attached. Heavyweight cannot install here — use [`install-light.md`](install-light.md), or attach a classic x86 cluster for Heavyweight.
 
 ### Check 2: DBR version
 
@@ -430,9 +444,6 @@ If you only need to configure one cluster (one-off SA setup), the UI path descri
 | Init script fails on `apt update` | DNS / network issue from cluster | Check NSG/firewall to Ubuntu repos |
 | Permission denied reading from Volume | UC permissions on Volume | Grant `READ VOLUME` to the cluster's service principal |
 
-## Notes on serverless
+## Lightweight alternative
 
-GeoBrix does **not** run on Serverless compute. The GDAL native dependency requires cluster-level installation, which Serverless doesn't expose. If your workload requires Serverless, consider:
-
-- Using native DBSQL `ST_` functions (public preview, DBR 17.1+) for vector ops
-- Pre-processing rasters on a classic cluster and persisting to Delta, then querying from Serverless
+For Serverless or simpler install (no JAR/init script), use **[`references/install-light.md`](install-light.md)** — the default path for most raster work.

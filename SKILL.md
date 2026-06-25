@@ -1,6 +1,6 @@
 ---
 name: databricks-geobrix-raster
-description: Process raster geospatial data on Databricks — satellite imagery, elevation models, weather grids, nighttime lights, land cover, and other gridded spatial data. Use when reading GeoTIFF (.tif/.tiff), NetCDF (.nc), or GRIB files; computing vegetation/water/burn indices like NDVI/NDWI/NBR; clipping rasters to polygons or country/city boundaries; reprojecting between coordinate systems (CRS, EPSG); aggregating raster pixel values to H3 hexagons or zones (zonal statistics — mean/sum/max per region); mosaicking/stitching adjacent tiles; tiling large scenes for parallel processing; or working with imagery from Sentinel, Landsat, MODIS, VIIRS, or other earth observation missions. Implementation uses the GeoBrix RasterX library (successor to Mosaic) on a classic Databricks cluster. Triggers on terms like raster, GeoTIFF, .tif, satellite imagery, NDVI, NDWI, vegetation index, zonal stats, elevation, DEM, DTM, Sentinel, Landsat, VIIRS, MODIS, nighttime lights, land cover, H3 raster aggregation, raster to hex, clip raster, reproject raster, mosaic raster, rasterize, GeoBrix, RasterX, GDAL, spatial raster.
+description: Process raster geospatial data on Databricks — satellite imagery, elevation models, weather grids, nighttime lights, land cover, and other gridded spatial data. Use when reading GeoTIFF (.tif/.tiff), NetCDF (.nc), or GRIB files; computing vegetation/water/burn indices like NDVI/NDWI/NBR; clipping rasters to polygons or country/city boundaries; reprojecting between coordinate systems (CRS, EPSG); aggregating raster pixel values to H3 hexagons or zones (zonal statistics — mean/sum/max per region); mosaicking/stitching adjacent tiles; tiling large scenes for parallel processing; or working with imagery from Sentinel, Landsat, MODIS, VIIRS, or other earth observation missions. Implementation uses GeoBrix RasterX (Lightweight or Heavyweight execution tier; default Lightweight on Serverless). Triggers on terms like raster, GeoTIFF, .tif, satellite imagery, NDVI, NDWI, vegetation index, zonal stats, elevation, DEM, DTM, Sentinel, Landsat, VIIRS, MODIS, nighttime lights, land cover, H3 raster aggregation, raster to hex, clip raster, reproject raster, mosaic raster, rasterize, GeoBrix, RasterX, GDAL, spatial raster.
 ---
 
 # Databricks GeoBrix Raster
@@ -24,7 +24,7 @@ Use this skill when the user is working on:
 - **Aggregating raster pixels to regions** — either *H3 cells* (uniform hex grid) or *arbitrary polygons* (zonal stats: mean elevation per county, total rainfall per watershed, etc.)
 - **Tiling / chunking** large scenes for parallel processing
 - **Rasterizing** vector geometries into a grid
-- **Cluster setup** for GeoBrix (GDAL init script, JAR + WHL install)
+- **Cluster setup** for GeoBrix (Lightweight `%pip [light]` on Serverless, or Heavyweight JAR + init script on classic x86)
 
 Trigger phrases that indicate this skill, even without "GeoBrix":
 - "I have a TIFF file at..." / "process this satellite image" / "compute NDVI on..."
@@ -37,6 +37,51 @@ Do NOT use this skill for:
 - Pure vector geospatial work (points, lines, polygons without rasters) — use native DBSQL `ST_` functions (covered in `databricks-dbsql`)
 - H3 indexing of point/polygon data alone (no raster involved) — use native DBSQL H3 functions
 
+## Background
+
+GeoBrix is the successor to DBLabs Mosaic, modernized for the Data Intelligence Platform. It exposes three packages — but only **RasterX** is meaningfully the right tool for new work:
+
+- **RasterX** — raster processing (the focus of this skill).
+- **GridX** — discrete global grid indexing. For fresh **H3 work on point/polygon data**, use **native DBSQL `H3_*` functions** (covered in the `databricks-dbsql` skill). GridX is the right tool only for **BNG (British National Grid)** or **migrating Mosaic grid code**.
+- **VectorX** — *not the right tool for general vector work.* It contains a single migration helper for converting legacy Mosaic geometries to native UC `GEOMETRY`/`GEOGRAPHY` types. For all other vector operations (`ST_Intersects`, buffers, spatial joins, geometry construction), use **native DBSQL `ST_` functions** (also covered in `databricks-dbsql`).
+
+GeoBrix is Beta and community-maintained (AS-IS, no SLA). It ships two **execution tiers** — **Lightweight** (`pyrx`, Serverless + classic) and **Heavyweight** (`rasterx`, classic x86 only). See [execution tiers](https://databrickslabs.github.io/geobrix/docs/api/execution-tiers/) and [databrickslabs.github.io/geobrix](https://databrickslabs.github.io/geobrix/).
+
+## Execution tier selection
+
+**Canonical rulebook** for tier, compute, readers, and install routing. Apply this to every raster task — before install, in Phase 1, and when recommending (a)/(b) under Substitution policy below.
+
+Before install, pick **tier** then **compute**. Source: [Choosing an Execution Tier](https://databrickslabs.github.io/geobrix/docs/api/execution-tiers/).
+
+**Defaults (in order):**
+1. **Tier = Lightweight** (`pyrx`) unless a heavy-only surface applies
+2. **Compute = Serverless** for Lightweight (classic only when Serverless unavailable or undetectable)
+
+| | Lightweight (`pyrx`) | Heavyweight (`rasterx`) |
+|---|---|---|
+| Install | [`install-light.md`](references/install-light.md) — `%pip [light]` wheel | [`install-heavy.md`](references/install-heavy.md) — JAR + init script + WHL |
+| Compute | Serverless (preferred), classic shared/ARM/dedicated | Classic **x86** only |
+| Bootstrap | `register(spark)` for `*_gbx` I/O, then `pyrx.functions.register(spark)` for `rst_*` | `rasterx.functions.register(spark)` only (JAR registers readers) |
+| GeoTIFF reader | `gtiff_gbx` | `gtiff_gdal` |
+| Generic raster reader | `raster_gbx` | `gdal` |
+
+**Route to Heavyweight when ANY apply:** OGR readers (`*_ogr`), exotic `gdal` driver options, PMTiles writer, `conforming` GridX/VectorX triangulation, existing JAR+init script to reuse, or `pyrx` unavailable in the installed release.
+
+**Route to Lightweight** for typical RasterX work this skill covers when none of the above apply: GeoTIFF/COG read, metadata, `rst_*` analytics (stats, clip, reproject, NDVI, H3, zonal stats), and SMALL/MEDIUM size routing.
+
+**Compute routing:**
+
+| Tier | Default compute | Fallback |
+|---|---|---|
+| Light | Serverless + `install-light.md` | Classic + light if Serverless not enabled / not in Connect dropdown |
+| Heavy | Classic x86 + heavy install | On Serverless → STOP, switch to classic x86 |
+
+If Lightweight task and user is on classic: recommend Serverless via Connect first; proceed on classic only as fallback.
+
+> **Outstanding (deferred):**
+> - **Light tier in examples:** Phase 3 `rst_*` analytics are tier-agnostic, but example docs and Phase 2b/3 snippets still hardcode Heavy (`rasterx`, `gtiff_gdal`/`gdal`). Update `references/examples/raster-analytics.md`, `h3-examples.md`, and `large-raster-retile.md` to use the Phase 1 bootstrap pattern (`register(spark)` + `GEOTIFF_READER`/`GENERIC_READER` for Light; `rasterx` + `gtiff_gdal`/`gdal` for Heavy). Align `SKILL.md` Phase 2b with `GEOTIFF_READER` from Phase 1. Leave `netcdf-ingest.md` heavy-only until the NetCDF light path is defined.
+> - NetCDF/GRIB upfront tier routing and xarray→GeoTIFF→light path — see existing `netcdf-ingest.md` (heavy) until Phase 2 pass.
+
 ## Substitution policy — GeoBrix is the default. STOP and ASK before any fallback.
 
 **When this skill is loaded and the user has a raster task, use GeoBrix.** Do NOT substitute another library (rasterio, gdal CLI, geopandas, etc.) just because GeoBrix isn't installed yet. Substituting bypasses the entire reason this skill exists (Spark-native distributed processing, UC integration, scale beyond a single node).
@@ -44,17 +89,20 @@ Do NOT use this skill for:
 **If GeoBrix is not installed on the cluster:**
 
 1. **Tell the user explicitly:** "GeoBrix isn't installed on this cluster."
-2. **Default recommendation is to install GeoBrix.** Offer to walk through `references/install.md` (pre-flight checks + parameter collection + setup). This is the path that respects the user's intent in invoking the skill.
-3. **STOP. Do not proceed with any code execution.** Ask the user a direct yes/no question and wait for their answer:
-   > *"GeoBrix isn't installed. I can walk you through the install (init script + cluster restart), or fall back to a different library for this one task. Want me to: **(a) install GeoBrix**, or **(b) use a non-GeoBrix fallback for this single task only**?"*
-4. **Do NOT infer consent.** A prompt that mentions "exploratory" or "one-off" or "just for this notebook" is not consent. The user asking the original question is not consent. Only an explicit "yes, use a fallback" or "yes, option b" from the user is consent.
-5. **If — and only if — the user explicitly picks (b)**, proceed with rasterio (or appropriate alternative). Always flag it in the response: *"Using rasterio for this one task per your confirmation. GeoBrix is the right tool for production / multi-file / large-raster work — install when ready."*
-6. **If the user picks (a)**, walk through `references/install.md` from the parameter-collection step onwards.
+2. **Apply Execution tier selection** to the user's task. Summarize the recommended tier and compute in **one sentence** (Light vs Heavy, and Serverless vs classic if relevant). If format or compute is ambiguous, state your assumption and what would change the recommendation. **Do not install or run processing code based on this alone.**
+3. **STOP. Do not proceed with any code execution.** Present that one-line recommendation, then ask and wait for the user's answer:
+   > *"GeoBrix isn't installed. Based on your task, I'd recommend **(a) Lightweight** [one-line reason from Execution tier selection] — or **(b) Heavyweight** if [heavy-only condition from that section]. I can also **(c) use a non-GeoBrix fallback for this single task only** if you prefer. Which do you want?"*
+4. **Do NOT infer consent.** A prompt that mentions "exploratory" or "one-off" or "just for this notebook" is not consent. The user asking the original question is not consent. Your tier recommendation is not consent. Only an explicit choice — (a), (b), or (c) — is consent.
+5. **If — and only if — the user explicitly picks (c)**, proceed with rasterio (or appropriate alternative). Always flag it in the response: *"Using rasterio for this one task per your confirmation. GeoBrix is the right tool for production / multi-file / large-raster work — install when ready."*
+6. **If the user picks (a)**, walk through `references/install-light.md` from the parameter-collection step onwards (Serverless preferred per Execution tier selection; classic fallback if Serverless unavailable).
+7. **If the user picks (b)**, walk through `references/install-heavy.md` from the parameter-collection step onwards.
 
 **Hard rules:**
 - Never decide "all fallback conditions are met" on your own and proceed. That's the LLM inferring consent. The skill explicitly forbids it.
-- Never write code that uses rasterio / gdal / geopandas for **raster processing** until the user has confirmed (b) in this conversation.
+- **Recommendations are encouraged; auto-selection is not.** Use Execution tier selection for the recommendation; the user picks (a), (b), or (c).
+- Never write code that uses rasterio / gdal / geopandas for **raster processing** until the user has confirmed (c) in this conversation.
 - Never frame the fallback as "since this is a one-off, I'll use rasterio." Frame it as a choice: "Want me to install GeoBrix or fall back?"
+- Honor the user's explicit (a) or (b) even when it differs from your recommendation, unless Execution tier selection makes it impossible (e.g. Heavy on Serverless → explain and ask them to switch compute or pick Light).
 
 The user invoked this skill because they want GeoBrix. Respect that until they explicitly say otherwise.
 
@@ -69,7 +117,7 @@ The substitution policy above forbids rasterio as a stand-in for GeoBrix in the 
 | **Reading the source raster for ingest** (instead of `spark.read.format("gdal")`) | ❌ Forbidden | This is the substitution the policy exists to prevent. |
 | **Raster transformations** (clip, reproject, mosaic, NDVI, zonal stats) | ❌ Forbidden | All of these are GeoBrix-native; substituting rasterio loses parallelism and Spark integration. |
 | **Replacing GeoBrix because "the file is small"** | ❌ Forbidden | Phase 2a's size check determines routing; size alone doesn't justify swapping libraries. |
-| **Replacing GeoBrix because "GeoBrix isn't installed"** | ❌ Forbidden without explicit consent | This is the (b) escape valve in the substitution policy. Requires user opt-in. |
+| **Replacing GeoBrix because "GeoBrix isn't installed"** | ❌ Forbidden without explicit consent | This is the (c) escape valve in the substitution policy. Requires user opt-in. |
 
 **Whenever you use rasterio under one of the allowed exceptions, surface it explicitly in your response:** "Using rasterio for [metadata read / final visualization]; GeoBrix is still doing the [retile / persist / clip / aggregation]." Don't be silent about it — the user should always see which library is doing what.
 
@@ -81,77 +129,100 @@ dbutils.library.restartPython()
 ```
 Or add `rasterio` to the cluster's Libraries tab for repeated use.
 
-## Background
-
-GeoBrix is the successor to DBLabs Mosaic, modernized for the Data Intelligence Platform. It exposes three packages — but only **RasterX** is meaningfully the right tool for new work:
-
-- **RasterX** — raster processing (the focus of this skill).
-- **GridX** — discrete global grid indexing. For fresh **H3 work on point/polygon data**, use **native DBSQL `H3_*` functions** (covered in the `databricks-dbsql` skill). GridX is the right tool only for **BNG (British National Grid)** or **migrating Mosaic grid code**.
-- **VectorX** — *not the right tool for general vector work.* It contains a single migration helper for converting legacy Mosaic geometries to native UC `GEOMETRY`/`GEOGRAPHY` types. For all other vector operations (`ST_Intersects`, buffers, spatial joins, geometry construction), use **native DBSQL `ST_` functions** (also covered in `databricks-dbsql`).
-
-GeoBrix is Beta, runs **only on Databricks Runtime (classic clusters, not Serverless)**, and is community-maintained (AS-IS, no SLA). See [databrickslabs.github.io/geobrix](https://databrickslabs.github.io/geobrix/).
-
 ## Prerequisites
 
-- **DBR 17.1 or later** (LTS releases recommended)
-- **Classic cluster** (Serverless is not supported)
-- **Unity Catalog Volume** to host the JAR, `.so`, and init script
-- **Cluster admin permissions** to attach init scripts and libraries
+**Lightweight (default):**
+- DBR **17.3 LTS or 18 LTS**; Python 3.12 (Serverless environment **5+** on Serverless)
+- UC Volume for WHL staging (no JAR/init script)
+- Setup: [`references/install-light.md`](references/install-light.md)
 
-Full setup steps: see `references/install.md`.
+**Heavyweight:**
+- DBR **17.1+** on classic **x86**
+- UC Volume for JAR, `.so`, init script, and WHL
+- Cluster admin permissions (`CAN MANAGE`) for init scripts and libraries
+- Setup: [`references/install-heavy.md`](references/install-heavy.md)
 
 ## Workflow
 
-### Phase 1: Verify compute type, then verify GeoBrix is installed
+### Phase 1: Pick tier + compute, verify GeoBrix is installed
 
-**1a. Confirm you're on a classic interactive cluster.** GeoBrix does **not** run on Serverless compute or SQL warehouses — they don't support cluster-level init scripts or JAR installation.
+**1a. Tier selection** — see **Execution tier selection** above. Default: Lightweight on Serverless.
 
-In a notebook: click the **Connect** dropdown at the top right. The attached compute must be a **classic All-Purpose / Interactive cluster** (look for the cluster icon, not "Serverless" or "SQL warehouse"). If it isn't:
-- Pick or create a classic cluster from the Connect dropdown
-- Attach the notebook to it and re-run
-
-If you're working from the **SQL Editor**, you can't run GeoBrix there at all — switch to a notebook attached to a classic cluster.
-
-**1b. Verify GeoBrix is registered AND inspect the actual API surface (prevents hallucinated function names):**
+**1b. Detect compute + Serverless-first recommendation**
 
 ```python
-try:
-    from databricks.labs.gbx.rasterx import functions as rx
-    rx.register(spark)
-
-    # AUTHORITATIVE signal — the Python API surface you actually call. Prefix-independent.
-    # Use ONLY names that appear here for any rx.<name>(...) call.
-    # Do not invent names (no read_raster, no load_tiff, etc.)
-    api_names = sorted(name for name in dir(rx) if not name.startswith("_"))
-    rst_fns = [n for n in api_names if n.startswith("rst_")]
-    print(f"✅ GeoBrix installed: {len(rst_fns)} rst_* functions on the Python API.")
-
-    # SQL registration check — the SQL prefix varies by version (`rst_*` or `rst_*`),
-    # so match EITHER with a contains-pattern. Do NOT hardcode one prefix: a wrong guess
-    # returns 0 silently and looks like "installed but empty".
-    n_sql = spark.sql("SHOW FUNCTIONS LIKE '*rst_*'").count()
-    print(f"   SQL functions registered (matching *rst_*): {n_sql}")
-
-    print("\nrx.<...> API (use only these names):")
-    print(", ".join(api_names))
-except Exception as e:
-    print(f"❌ GeoBrix not installed or misconfigured: {e}")
+cluster_id = spark.conf.get("spark.databricks.clusterUsageTags.clusterId", "")
+COMPUTE = "serverless" if not cluster_id else "classic"
+print(f"Compute: {COMPUTE}")
 ```
 
-**If `rst_fns` is non-empty** → GeoBrix is installed, proceed to Phase 2. (The `dir(rx)` list is the source of truth; the SQL count is a secondary confirmation that registration also exposed the functions to Spark SQL.)
+- **Lightweight + classic:** recommend switching to **Serverless** via Connect (unless Serverless not listed). Proceed on classic only as fallback.
+- **Heavyweight + Serverless:** STOP — *"This task needs Heavyweight. Switch to a classic x86 cluster via Connect."*
+- **SQL Editor:** switch to a notebook with Serverless or classic compute attached.
 
-**Determine the SQL prefix for THIS install before calling any function in SQL.** Don't assume either `gbx_rst_` or `rst_` — it varies by version. If you need the SQL names, print them: `spark.sql("SHOW FUNCTIONS LIKE '*rst_*'").show(truncate=False)` — and use exactly what it prints. In Python (the form this skill uses throughout), it's always `rx.rst_*`.
+**1c. Install routing (if not yet installed)**
+
+| Compute | Tier | Install doc |
+|---|---|---|
+| Serverless | light | [`references/install-light.md`](references/install-light.md) |
+| Serverless | heavy | STOP → classic x86 |
+| Classic | light | [`references/install-light.md`](references/install-light.md) (Serverless preferred if available) |
+| Classic | heavy | [`references/install-heavy.md`](references/install-heavy.md) |
+| Any | light, `pyrx` missing | Heavyweight on classic or upgrade GeoBrix |
+
+Before install, **collect `volume_path`** (propose-then-confirm) — both install docs list parameters.
+
+**1d. Verify GeoBrix + inspect API surface**
+
+Try Lightweight first, then Heavyweight if `pyrx` import fails. Lightweight: `register(spark)` then `rx.register(spark)`. Heavyweight: `rx.register(spark)` only — readers come from the cluster JAR.
+
+On clusters with **both** tiers installed, this block selects Light when `pyrx` is importable. If the cluster is heavy-only (JAR + init script, no `[light]` wheel), the heavy branch runs automatically.
+
+```python
+TIER = None
+rx = None
+
+try:
+    from databricks.labs.gbx.ds.register import register
+    from databricks.labs.gbx.pyrx import functions as rx
+    register(spark)
+    rx.register(spark)
+    TIER = "light"
+    GEOTIFF_READER = "gtiff_gbx"
+    GENERIC_READER = "raster_gbx"
+except ImportError:
+    try:
+        from databricks.labs.gbx.rasterx import functions as rx
+        rx.register(spark)
+        TIER = "heavy"
+        GEOTIFF_READER = "gtiff_gdal"
+        GENERIC_READER = "gdal"
+    except Exception as e:
+        print(f"❌ GeoBrix not installed: {e}")
+
+if rx is not None:
+    api_names = sorted(name for name in dir(rx) if not name.startswith("_"))
+    rst_fns = [n for n in api_names if n.startswith("rst_")]
+    n_sql = spark.sql("SHOW FUNCTIONS LIKE '*rst_*'").count()
+    print(f"✅ GeoBrix {TIER}: {len(rst_fns)} rst_* functions")
+    print(f"   Readers: {GEOTIFF_READER}, {GENERIC_READER}")
+    print(f"   SQL functions (matching *rst_*): {n_sql}")
+    print("\nrx API:", ", ".join(api_names))
+```
+
+**If both imports fail** → install per 1c. Lightweight: `install-light.md`. Heavyweight: `install-heavy.md`.
 
 **Hard rule on the API surface:**
 - `rx` exposes only the names printed above (typically `register` + `rst_<...>` functions).
-- **There is NO `rx.read_raster`, `rx.load_tiff`, `rx.from_path`, or any other "read" helper on the `rx` module.** Raster ingestion is always via `spark.read.format("gtiff_gdal" | "gdal").load(path)` (Phase 2b) or via the prescribed retile-and-persist pattern (Phase 2c). If you find yourself reaching for an `rx.read_*` or `rx.load_*` function, stop — it doesn't exist.
-- **For function details (signature, purpose, category) → read `references/functions.md`.** It's the curated catalog of every `rst_*` function organized by category (metadata, transformations, generators, H3 aggregation, etc.).
-- **DO NOT run `DESCRIBE FUNCTION EXTENDED <name>` on each function** as a way to learn the API (and note the SQL name's prefix varies by version — see Phase 1b). It's slow (one SQL call per function), the output is Spark-formatted (not user-friendly), and the same information already lives in `references/functions.md`. The only valid use of `DESCRIBE FUNCTION EXTENDED` is debugging a specific signature mismatch at runtime.
-- If you're unsure whether a function exists or what it does, in order: (1) check the printed `api_names` list above, (2) grep `references/functions.md`, (3) if both miss, the function doesn't exist — don't invent it.
+- **There is NO `rx.read_raster`, `rx.load_tiff`, `rx.from_path`, or any other "read" helper on the `rx` module.** Raster ingestion is via `spark.read.format(...)` (Phase 2b/2c). On Lightweight use `gtiff_gbx`/`raster_gbx`; on Heavyweight use `gtiff_gdal`/`gdal`.
+- **For function details → read `references/functions.md`.**
+- **DO NOT run `DESCRIBE FUNCTION EXTENDED` on each function** to learn the API.
+- If unsure whether a function exists: (1) check `api_names`, (2) grep `references/functions.md`, (3) don't invent it.
 
-**If the import or SQL check fails** on a classic cluster → the cluster needs bootstrap. See `references/install.md` for the full procedure (download artifacts → upload to UC Volume → configure init script + library on a classic DBR 17.1+ cluster).
-
-Before running any install step, **collect parameters from the user** (Volume path, cluster ID, GeoBrix version) — `install.md` lists them up-front and the snippets won't work with placeholders. Once installed, re-run the check above.
+**1e. Install failure troubleshooting**
+- Light on Serverless: re-check PEP 508 `%pip` string and Serverless env 5+
+- `pyrx` ImportError after install: release may lack Lightweight → heavy on classic
+- Heavy: init script / JAR issues → see `install-heavy.md` troubleshooting table
 
 ### Phase 2: STOP. Run the size check before anything else.
 
@@ -382,12 +453,15 @@ Apply the same propose-and-confirm pattern wherever a table name is needed (`ret
 | `UnsatisfiedLinkError: libgdalalljni.so` | `.so` not copied to `/usr/lib/` — re-check init script |
 | `Driver not found` on read | Provide `driverName` option, or use a named reader (`gtiff_gdal`) |
 | Out-of-memory on large rasters | Increase `sizeInMB` split, or use `rx.rst_retile` to chunk |
-| Serverless cluster fails | GeoBrix requires classic clusters — Serverless not supported |
+| Lightweight fails on Serverless | Check Serverless env 5+ (Python 3.12); use PEP 508 `%pip` form in `install-light.md` |
+| `pyrx` ImportError after install | Release may lack Lightweight — use Heavyweight on classic x86 or upgrade GeoBrix |
+| Heavyweight on Serverless | Impossible — switch to classic x86, or use Lightweight |
 
 ## Resources
 
 ### References
-- `references/install.md` — Detailed cluster setup, init script content, troubleshooting
+- `references/install-light.md` — Lightweight install (Serverless, `%pip [light]`)
+- `references/install-heavy.md` — Install router + Heavyweight cluster setup (JAR, init script, troubleshooting)
 - `references/functions.md` — Full RasterX function reference (metadata, transformations, generators, H3 aggregation)
 - `references/examples/large-raster-retile.md` — Large **single-grid** raster (LARGE routing) retile-and-persist pattern for GeoTIFF/COG, `.jp2`, `.img`: read → inspect true dimensions → auto-sized retile → Delta persist → H3 aggregation (NetCDF/GRIB out of scope)
 - `references/examples/netcdf-ingest.md` — NetCDF/GRIB (SUBDATASET routing) two-scenario flow: rechunk one big `.nc` by a variable (xarray), then analyse chunked files with GeoBrix — CRS check/align, hourly-band explode, clip-to-city, H3 time-series

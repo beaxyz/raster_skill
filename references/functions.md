@@ -1,8 +1,21 @@
 # RasterX Function Reference
 
-All RasterX functions operate on a `tile` column (raster type). In **Python** (the form this skill uses throughout) they're accessed as `rx.rst_*` after `rx.register(spark)`. The **SQL** prefix is version-dependent — `gbx_rst_*` per the docs, but some installs register them as bare `rst_*`; confirm with `SHOW FUNCTIONS LIKE '*rst_*'` before calling them in SQL. This catalog lists the bare `rst_*` names.
+GeoBrix has two execution tiers with the same `rst_*` API — **Lightweight** (`pyrx`) and **Heavyweight** (`rasterx`). See [execution tiers](https://databrickslabs.github.io/geobrix/docs/api/execution-tiers/) and `references/install-light.md` / `references/install-heavy.md`.
+
+All RasterX functions operate on a `tile` column (raster type). In **Python** they're accessed as `rx.rst_*` after `rx.register(spark)`.
+
+**Lightweight:** `register(spark)` registers `*_gbx` readers/writers; `rx.register(spark)` registers `rst_*` functions — both are required.
+
+**Heavyweight:** the cluster JAR registers `gtiff_gdal` / `gdal`; call `rx.register(spark)` only.
 
 ```python
+# Lightweight
+from databricks.labs.gbx.ds.register import register
+from databricks.labs.gbx.pyrx import functions as rx
+register(spark)
+rx.register(spark)
+
+# Heavyweight
 from databricks.labs.gbx.rasterx import functions as rx
 rx.register(spark)
 ```
