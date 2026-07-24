@@ -2,7 +2,7 @@
 
 Runs on a `tile` column from **any** ingestion route — Phase 2b (standard read), 2c (retile-and-persist), or 2d (NetCDF/GRIB reduced to tiles). Nothing here is format-specific.
 
-Each section explains a function: **what it does, when to use it, and which parameters are yours to choose.** Pick only what the workflow needs (none are required), and treat every literal value (CRS code, region, band layout) as an example. For H3, see `h3-examples.md`.
+Each section explains a function: **what it does, when to use it, and which parameters are yours to choose.** Pick only what the workflow needs (none are required), and treat every literal value (CRS code, region, band layout) as an example. For H3, see `h3.md`.
 
 ```python
 from databricks.labs.gbx.rasterx import functions as rx
@@ -103,4 +103,4 @@ Two approaches: clip per polygon (cross raster tiles with the polygon set via `r
 
 ---
 
-See `references/functions.md` for the full catalog, and `h3-examples.md` for putting raster values on an H3 grid.
+See `references/functions.md` for the full catalog, and `h3.md` for putting raster values on an H3 grid.

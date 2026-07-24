@@ -4,7 +4,7 @@ Install GeoBrix **Lightweight** tier (`pyrx`) — a single wheel with no JAR, no
 
 Source: [GeoBrix execution tiers](https://databrickslabs.github.io/geobrix/docs/api/execution-tiers/) and [GitHub quick start](https://github.com/databrickslabs/geobrix#quick-start-lightweight).
 
-For **Heavyweight** (JAR + init script on classic x86), see [`references/install-heavy.md`](install-heavy.md).
+For **Heavyweight** (JAR + init script on classic x86), see [`references/1-install/install-heavy.md`](1-install/install-heavy.md).
 
 ## When to use this path
 
@@ -28,7 +28,7 @@ Route to **Heavyweight** instead when the task needs OGR readers (`*_ogr`), exot
 
 ## Parameters
 
-Same propose-then-confirm pattern as `install-heavy.md`. Lightweight only needs the WHL in a Volume.
+Same propose-then-confirm pattern as `1-install/install-heavy.md`. Lightweight only needs the WHL in a Volume.
 
 ### Ask the user (propose-then-confirm)
 
@@ -86,7 +86,7 @@ else:
 
 ### Check 3: UC Volume reachable
 
-Same as `install-heavy.md` Check 3 — confirm `volume_path` exists and is writable.
+Same as `1-install/install-heavy.md` Check 3 — confirm `volume_path` exists and is writable.
 
 ### Check 4: Version availability gate
 
@@ -97,7 +97,7 @@ try:
 except ImportError:
     print("⚠️  pyrx not installed yet — normal before %pip.")
     print("   After install, if import still fails, this GeoBrix release may not ship Lightweight.")
-    print("   Fall back to Heavyweight on classic x86 (see install-heavy.md).")
+    print("   Fall back to Heavyweight on classic x86 (see 1-install/install-heavy.md).")
 ```
 
 ## Step 1: Download the wheel
@@ -162,7 +162,7 @@ print(f"   SQL functions (matching *rst_*): {n_sql}")
 print(f"   Tier: light | Readers: gtiff_gbx, raster_gbx")
 ```
 
-If `ImportError` on `pyrx` after `%pip` and restart → this release likely lacks Lightweight. Use Heavyweight (`install-heavy.md`) on classic x86 or upgrade GeoBrix.
+If `ImportError` on `pyrx` after `%pip` and restart → this release likely lacks Lightweight. Use Heavyweight (`1-install/install-heavy.md`) on classic x86 or upgrade GeoBrix.
 
 ## Troubleshooting
 

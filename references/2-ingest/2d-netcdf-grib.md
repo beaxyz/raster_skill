@@ -105,8 +105,8 @@ netcdf.select(rx.rst_srid("tile").alias("srid")).distinct().show()
 
 Once Scenario B lands a `tile`/`srid_tile` column, the analytics are **the same as for any ingested raster** — they're documented format-agnostically, not here:
 
-- **Stats & clip & zonal** → `references/examples/raster-analytics.md`
-- **H3 (tessellate / aggregate / time-series)** → `references/examples/h3-examples.md`
+- **Stats & clip & zonal** → `references/3-process/analytics.md`
+- **H3 (tessellate / aggregate / time-series)** → `references/3-process/h3.md`
 
 **The one NetCDF thing to carry forward:** the bands are **timesteps**, so use the **multi-temporal** variants in those docs — `posexplode` *all* bands and map `band_index → timestamp`; never index `[0]`. *How* you map `band_index` to a real time depends on how your files lay out time (one file per day with hourly bands, one file per timestep, a time coordinate variable, …) — there's no fixed formula. If, for example, each file is a day with hourly bands and the date is in the filename:
 
@@ -117,7 +117,7 @@ Once Scenario B lands a `tile`/`srid_tile` column, the analytics are **the same 
 .withColumn("timestamp", F.expr("timestampadd(HOUR, band_index, cast(date as timestamp))"))  # bands = hours
 ```
 
-See the temporal-stack and pre-retile sections of `h3-examples.md` for the generalized H3 time-series, and `raster-analytics.md` for clip/stats.
+See the temporal-stack and pre-retile sections of `../3-process/h3.md` for the generalized H3 time-series, and `../3-process/analytics.md` for clip/stats.
 
 ---
 
@@ -134,5 +134,5 @@ Scenario B lands a `tile`/`srid_tile` column (or exploded H3 rows) — that's **
 | Bands = timesteps, not spectral | `posexplode` all bands + `band_index → timestamp`; don't index `[0]` |
 | CRS | Check `rst_srid("tile")` first — often inferred from CF metadata. Align to your boundary's CRS via `rst_transform`. If genuinely `0`, **ask the user** for the EPSG — don't hardcode |
 | `to_netcdf` fails on `/Volumes` | write to `/tmp` then `shutil.copy` to the Volume |
-| Coarse grid → too few H3 cells | `rst_tooverlappingtiles` (sub-tile size is your choice) before `rst_h3_rastertogridavg` — see `h3-examples.md` |
+| Coarse grid → too few H3 cells | `rst_tooverlappingtiles` (sub-tile size is your choice) before `rst_h3_rastertogridavg` — see `../3-process/h3.md` |
 | `rst_clip` geometry | pass a **WKT string** (`F.lit(wkt)`), not a UC `GEOMETRY` |
