@@ -28,7 +28,7 @@ Use it whenever the task is **raster-first**: each pixel has a value at a geogra
 
 **Do not use** for pure vector work (points/lines/polygons without rasters) or H3 on point data alone — use native DBSQL `ST_` / `H3_*` functions instead.
 
-GeoBrix officially supports **GeoTIFF** for production ingest. NetCDF/GRIB are best-effort via GDAL subdatasets — see [`references/examples/netcdf-ingest.md`](references/examples/netcdf-ingest.md).
+GeoBrix officially supports **GeoTIFF** for production ingest. NetCDF/GRIB are best-effort via GDAL subdatasets — see [`references/2-ingest/2d-netcdf-grib.md`](references/2-ingest/2d-netcdf-grib.md).
 
 ## Using this skill
 
@@ -56,7 +56,7 @@ GeoBrix ships two tiers with the same `rst_*` analytics API:
 | Compute | **Serverless** (preferred) or classic | Classic **x86** only |
 | Install | `%pip [light]` wheel | JAR + GDAL init script + WHL |
 | GeoTIFF reader | `gtiff_gbx` | `gtiff_gdal` |
-| Doc | [`references/install-light.md`](references/install-light.md) | [`references/install-heavy.md`](references/install-heavy.md) |
+| Doc | [`references/1-install/install-light.md`](references/1-install/install-light.md) | [`references/1-install/install-heavy.md`](references/1-install/install-heavy.md) |
 
 **Defaults:** Lightweight on Serverless. Route to Heavyweight for OGR readers, PMTiles writer, exotic GDAL options, or when `pyrx` is unavailable.
 
@@ -88,13 +88,14 @@ Full routing rules → `SKILL.md` → **Execution tier selection**.
 | Path | Purpose |
 |---|---|
 | [`SKILL.md`](SKILL.md) | Agent skill — policies, tier routing, workflow phases |
-| [`references/install-light.md`](references/install-light.md) | Lightweight install (Serverless, `%pip [light]`) |
-| [`references/install-heavy.md`](references/install-heavy.md) | Heavyweight install (JAR, init script, WHL on classic x86) |
+| [`references/1-install/install-light.md`](references/1-install/install-light.md) | Lightweight install (Serverless, `%pip [light]`) |
+| [`references/1-install/install-heavy.md`](references/1-install/install-heavy.md) | Heavyweight install (JAR, init script, WHL on classic x86) |
 | [`references/functions.md`](references/functions.md) | `rx.*` function reference |
-| [`references/examples/raster-analytics.md`](references/examples/raster-analytics.md) | Phase 3 stats, clip, zonal (format-agnostic) |
-| [`references/examples/h3-examples.md`](references/examples/h3-examples.md) | Phase 3 H3 tessellation and aggregation |
-| [`references/examples/large-raster-retile.md`](references/examples/large-raster-retile.md) | Phase 2c large GeoTIFF retile-and-persist |
-| [`references/examples/netcdf-ingest.md`](references/examples/netcdf-ingest.md) | Phase 2d NetCDF/GRIB subdataset flow |
+| [`references/todo.md`](references/todo.md) | Internal backlog — format support, pattern gaps, tier consistency |
+| [`references/3-process/analytics.md`](references/3-process/analytics.md) | Phase 3 stats, clip, zonal (format-agnostic) |
+| [`references/3-process/h3.md`](references/3-process/h3.md) | Phase 3 H3 tessellation and aggregation |
+| [`references/2-ingest/2c-large-raster-retile.md`](references/2-ingest/2c-large-raster-retile.md) | Phase 2c large GeoTIFF retile-and-persist |
+| [`references/2-ingest/2d-netcdf-grib.md`](references/2-ingest/2d-netcdf-grib.md) | Phase 2d NetCDF/GRIB subdataset flow |
 
 ## Lightweight bootstrap (reference)
 
@@ -112,5 +113,4 @@ Heavyweight: `from databricks.labs.gbx.rasterx import functions as rx` then `rx.
 
 ## Outstanding (deferred)
 
-- Light tier bootstrap + reader swaps in example docs and tier-aware Phase 2b in `SKILL.md` — Phase 3 analytics unchanged; use `GEOTIFF_READER` / `GENERIC_READER` from Phase 1
-- NetCDF/GRIB upfront tier routing and xarray→GeoTIFF→light path (`netcdf-ingest.md` remains heavy-only for now)
+Backlog — format support, pattern gaps (visualization), and tier-consistency work — is tracked in [`references/todo.md`](references/todo.md).

@@ -1,6 +1,6 @@
 # RasterX Function Reference
 
-GeoBrix has two execution tiers with the same `rst_*` API — **Lightweight** (`pyrx`) and **Heavyweight** (`rasterx`). See [execution tiers](https://databrickslabs.github.io/geobrix/docs/api/execution-tiers/) and `references/install-light.md` / `references/install-heavy.md`.
+GeoBrix has two execution tiers with the same `rst_*` API — **Lightweight** (`pyrx`) and **Heavyweight** (`rasterx`). See [execution tiers](https://databrickslabs.github.io/geobrix/docs/api/execution-tiers/) and `references/1-install/install-light.md` / `references/1-install/install-heavy.md`.
 
 All RasterX functions operate on a `tile` column (raster type). In **Python** they're accessed as `rx.rst_*` after `rx.register(spark)`.
 

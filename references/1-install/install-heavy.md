@@ -4,8 +4,8 @@ GeoBrix has two **execution tiers** ([Choosing an Execution Tier](https://databr
 
 | Tier | Install doc | Compute | When |
 |---|---|---|---|
-| **Lightweight** (`pyrx`) — **default** | [`references/install-light.md`](install-light.md) | Serverless (preferred), classic shared/ARM/dedicated | Most raster tasks; `%pip [light]` wheel only |
-| **Heavyweight** (`rasterx`) | [`references/install-heavy.md`](install-heavy.md) — steps below | Classic **x86** only | OGR readers, exotic GDAL options, PMTiles writer, existing JAR+init setup, or `pyrx` unavailable |
+| **Lightweight** (`pyrx`) — **default** | [`references/1-install/install-light.md`](1-install/install-light.md) | Serverless (preferred), classic shared/ARM/dedicated | Most raster tasks; `%pip [light]` wheel only |
+| **Heavyweight** (`rasterx`) | [`references/1-install/install-heavy.md`](1-install/install-heavy.md) — steps below | Classic **x86** only | OGR readers, exotic GDAL options, PMTiles writer, existing JAR+init setup, or `pyrx` unavailable |
 
 **Defaults:** tier = Lightweight; compute = Serverless (classic only when Serverless unavailable). See `SKILL.md` → Execution tier selection.
 
@@ -18,7 +18,7 @@ Complete steps to install GeoBrix **Heavyweight** on a classic x86 cluster (JAR 
 ## Heavyweight prerequisites
 
 - **DBR 17.1 or later** (LTS preferred). Older runtimes lack native spatial types GeoBrix interoperates with.
-- **Classic x86 compute** — Heavyweight does not run on Serverless or ARM. Use [`install-light.md`](install-light.md) for Serverless.
+- **Classic x86 compute** — Heavyweight does not run on Serverless or ARM. Use [`1-install/install-light.md`](1-install/install-light.md) for Serverless.
 - **UC Volume** with write access — hosts the JAR, `.so`, init script, and WHL artifacts.
 - **Cluster permissions** to attach init scripts and upload libraries (`CAN MANAGE` on the cluster).
 
@@ -74,7 +74,7 @@ access_mode = mode_map.get(cluster_profile, cluster_profile)
 
 if not cluster_id:
     print("❌ Not on a classic cluster — required for Heavyweight install.")
-    print("   For Serverless / Lightweight tier, use references/install-light.md instead.")
+    print("   For Serverless / Lightweight tier, use references/1-install/install-light.md instead.")
     print("   For Heavyweight: click Connect and pick a classic x86 All-Purpose / Job cluster.")
 else:
     print(f"✅ Attached to a classic cluster")
@@ -144,7 +144,7 @@ Only run this after the user confirms (c) and confirms they have metastore admin
 - If install completes but `rx.register(spark)` fails later, the access mode is the first thing to check.
 - The Shared-mode allowlist friction has bitten multiple users — naming it upfront avoids a half-finished install.
 
-**If Check 1 fails (no `cluster_id`):** you are on Serverless or no compute is attached. Heavyweight cannot install here — use [`install-light.md`](install-light.md), or attach a classic x86 cluster for Heavyweight.
+**If Check 1 fails (no `cluster_id`):** you are on Serverless or no compute is attached. Heavyweight cannot install here — use [`1-install/install-light.md`](1-install/install-light.md), or attach a classic x86 cluster for Heavyweight.
 
 ### Check 2: DBR version
 
@@ -446,4 +446,4 @@ If you only need to configure one cluster (one-off SA setup), the UI path descri
 
 ## Lightweight alternative
 
-For Serverless or simpler install (no JAR/init script), use **[`references/install-light.md`](install-light.md)** — the default path for most raster work.
+For Serverless or simpler install (no JAR/init script), use **[`references/1-install/install-light.md`](1-install/install-light.md)** — the default path for most raster work.

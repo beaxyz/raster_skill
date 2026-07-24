@@ -4,6 +4,44 @@
 
 **Scope — single-grid rasters only.** This pattern applies to formats that present as one georeferenced grid with real bands and a real CRS: **GeoTIFF / COG**, JPEG2000 (`.jp2`), ERDAS IMAGINE (`.img`), and similar. It does **NOT** apply to **NetCDF or GRIB** — those expose variables as subdatasets and frequently carry no embedded CRS, so their read + metadata steps differ (see the NetCDF example). COG needs no special handling: it's a GeoTIFF and reads through the `GTiff` driver (there is no read-time "COG" driver).
 
+## Confirm LARGE routing (single-grid byte thresholds)
+
+Phase 2a Stage 1 gives `total_bytes` / `total_gb` / `n_files`. This is the single-grid byte
+route that decides LARGE vs SMALL/MEDIUM (bytes ≈ pixels ≈ processing cost — the assumption
+holds for single-grid, NOT for NetCDF/GRIB/HDF). If this prints LARGE, continue with the
+retile-and-persist steps below; if SMALL/MEDIUM, go to Phase 2b (standard read) instead.
+
+```python
+# Single-grid rasters (GeoTIFF/COG, JP2, IMG): bytes ≈ pixels, the heuristic holds.
+if n_files == 1:
+    print(f"Single file: {total_gb:.2f} GB")
+    avg_mb = total_gb * 1024
+else:
+    avg_mb = total_bytes / n_files / (1024**2)
+    print(f"avg {avg_mb:.1f} MB/file")
+
+if total_gb > 5:
+    routing = "LARGE"
+    print("\n*** ROUTING: LARGE ***")
+    print("MUST use the retile-and-persist pattern below.")
+    print("MUST NOT write any spark.read.format(...).load(source_path) call against the source.")
+elif n_files > 100 and avg_mb > 500:
+    routing = "LARGE"
+    print("\n*** ROUTING: LARGE (many large files) ***")
+    print("MUST use the retile-and-persist pattern below.")
+else:
+    routing = "SMALL/MEDIUM"
+    print("\n*** ROUTING: SMALL/MEDIUM ***")
+    print("Phase 2b standard read is appropriate — do NOT use this pattern.")
+
+print(f"\nRouting decision: {routing}")
+```
+
+**Non-negotiable, no creative interpretation:**
+- Route on **input** size, not anticipated output size. "The clip output is one small city, so I'll skip retiling" is forbidden — the cost is in reading the giant *input*.
+- Thresholds are minimum-bars, not preferences. When in doubt between standard read and retile-and-persist, **choose retile-and-persist**.
+- LARGE → retile-and-persist is the **only** approved path. There is no "smarter" shortcut (see anti-patterns below).
+
 ## Why the simple pattern fails at scale
 
 | Symptom | Cause |
@@ -65,6 +103,14 @@ raster_df = (
 # GeoBrix still does the heavy work (the retile + persist + all downstream Spark ops).
 # Empirically faster than the GeoBrix aggregation alternative on most clusters,
 # because it's a single header read on the driver instead of a distributed UDF pass.
+#
+# rasterio is NOT preinstalled on DBR — install once before using this option:
+#   %pip install rasterio
+#   dbutils.library.restartPython()
+#   # after restart, re-import + re-register GeoBrix (see Phase 1 bootstrap)
+# Or add `rasterio` to the cluster's Libraries tab for repeated use.
+# Surface it in your response: "Using rasterio for the metadata header read only;
+# GeoBrix still does the retile + persist + all downstream work."
 import rasterio
 with rasterio.open(src_path) as src:
     width, height = src.width, src.height
@@ -148,10 +194,27 @@ For a cluster with ~4 workers, ~200 tiles gives each worker ~50 tiles — a good
 
 ## After retile: downstream analytics
 
-The `tiles` DataFrame has a `tile` column — identical in shape to a Phase 2b standard read. From here it's **Phase 3**, format-agnostic: see `references/examples/raster-analytics.md` (stats, clip, zonal) and `references/examples/h3-examples.md` (H3 tessellation/aggregation, including the single-band `[0]` band-index gotcha).
+The `tiles` DataFrame has a `tile` column — identical in shape to a Phase 2b standard read. From here it's **Phase 3**, format-agnostic: see `references/3-process/analytics.md` (stats, clip, zonal) and `references/3-process/h3.md` (H3 tessellation/aggregation, including the single-band `[0]` band-index gotcha).
 
 ## When NOT to use this pattern
 
 - Small rasters (< 1 GB) — the persist-to-Delta overhead isn't worth it. Stick to the standard Phase 2–4 flow.
 - Single-tile operations (one polygon, one zonal stat) — the metadata-then-clip path is faster.
 - Truly streaming workloads — this pattern is batch-oriented; for continuous ingest, you'd structure differently.
+
+## Anti-patterns — DO NOT EMIT THESE for LARGE sources
+
+Every one of these reads the giant source directly (often repeatedly), which is exactly what
+retile-and-persist exists to prevent. There is no approved LARGE alternative.
+
+| Anti-pattern | Why it's wrong |
+|---|---|
+| `spark.read.format("gtiff_gdal").load(huge_file)` | Reads the giant file, often multiple times. The MB-bounded split is not a substitute for retile-and-persist. |
+| `SELECT * FROM rst_maketiles('{huge_file}', ...)` as the ingest step | `rst_maketiles` is a **generator** (build tiles from an extent + grid definition), not a file-ingest function. Using it to ingest a TIFF is either a misuse or a workaround for the size-check gate. Use the prescribed read pattern (small/medium) or retile-and-persist (large). |
+| `rst_fromfile(huge_file)` as the entry point | Same family as the SQL TVF above — a "direct constructor" that bypasses the size-check gate. Allowed only after Phase 2a routes the source as SMALL/MEDIUM. |
+| Read source twice (e.g. once for metadata, once for clipping) | Every downstream op re-pays the GDAL split cost. After Phase 2a, the next source read must be the one that persists to Delta. |
+| Read source → filter tiles by `rst_boundingbox` ∩ target bbox → clip survivors → merge | Still reads the giant source on every run. The "smart spatial filter" doesn't help; the cost is in the read, not the clip. Retile-and-persist instead. |
+| `rst_merge_agg` to a single tile before downstream work | Kills parallelism. Keep tiles separate; only merge if the final output format requires a single raster. |
+| `.write.format("gtiff_gdal").save(volume_path)` | `gtiff_gdal` is a **reader**, not a writer. This call does not produce a usable GTiff file. Persist as Delta tables; if you need a GTiff file artifact, extract `rst_asformat("tile", "GTiff")` and write the bytes via a different mechanism (e.g., `dbutils.fs.put` on the binary content). |
+| Picking `sizeInMB` "to make a large file manageable" | `sizeInMB` is an MB-bounded read-time split. It does not solve the underlying "read this giant file many times" problem. Use retile-and-persist. |
+| `rx.read_raster(...)`, `rx.load_tiff(...)`, `rx.from_path(...)`, or any other invented `rx.*` reader | These do NOT exist. Hallucinated function names. Raster ingestion is always via `spark.read.format(...)` per Phase 2b/2c. Check the `api_names` list from Phase 1 before calling any unfamiliar `rx.*` function. |
