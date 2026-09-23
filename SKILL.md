@@ -1,6 +1,15 @@
 ---
 name: databricks-geobrix-raster
-description: Ingest and process raster geospatial data at scale on Databricks with GeoBrix RasterX — the Spark-native, Unity-Catalog-integrated successor to Mosaic. Use this skill for two things: (1) INGESTING raster files into a distributed `tile` column via the GDAL/rasterio reader, and (2) PROCESSING rasters that are too large for one node or span many scenes. Ingestion is first-class for GeoTIFF/COG (.tif/.tiff) and best-effort for NetCDF (.nc) and GRIB (.grib/.grib2). A single small raster does NOT need GeoBrix — a library like rasterio does an NDVI, clip, or reproject in a few lines on one node; GeoBrix earns its place when the work is distributed (many scenes, or one scene too big for a node) or must live inside a Spark/UC pipeline. Triggers on terms like raster, GeoTIFF, .tif, .tiff, COG, satellite imagery (Sentinel, Landsat — GeoTIFF), weather/climate grids (GRIB/NetCDF), DEM/elevation, land cover, nighttime lights, read raster, ingest raster, raster to Delta, NDVI, zonal stats, raster to H3, clip/reproject/mosaic raster, GeoBrix, RasterX, GDAL raster reader, spatial raster.
+description: >-
+  Ingest and process raster geospatial data at scale on Databricks with GeoBrix
+  RasterX. Use for distributed GeoTIFF/COG ingestion into a `tile` column and
+  raster processing such as NDVI, clipping, reprojection, mosaicking, zonal
+  statistics, and H3 aggregation. Also covers best-effort NetCDF/GRIB ingestion
+  and choosing Lightweight versus Heavy readers. Trigger for raster, GeoTIFF,
+  COG, satellite imagery, DEM/elevation, land cover, nighttime lights,
+  NetCDF/GRIB, raster-to-Delta, RasterX, GeoBrix, or GDAL reader requests. Do not
+  use for a single small raster that fits on one node unless it must run within a
+  Spark or Unity Catalog pipeline.
 ---
 
 # Databricks GeoBrix Raster
