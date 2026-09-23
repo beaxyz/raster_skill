@@ -155,11 +155,18 @@ rx.register(spark)
 
 api_names = sorted(n for n in dir(rx) if not n.startswith("_"))
 rst_fns = [n for n in api_names if n.startswith("rst_")]
-n_sql = spark.sql("SHOW FUNCTIONS LIKE '*rst_*'").count()
 
 print(f"✅ Lightweight GeoBrix: {len(rst_fns)} rst_* on Python API")
-print(f"   SQL functions (matching *rst_*): {n_sql}")
 print(f"   Tier: light | Readers: gtiff_gbx, raster_gbx")
+
+# Optional SQL-registration count. `SHOW FUNCTIONS` can throw a SQL parse error on some
+# Serverless / Spark Connect runtimes, so keep it non-fatal — the Python API count above
+# is the real confirmation that GeoBrix registered.
+try:
+    n_sql = spark.sql("SHOW FUNCTIONS").filter("function LIKE '%rst_%'").count()
+    print(f"   SQL functions (matching rst_): {n_sql}")
+except Exception as e:
+    print(f"   (SQL function count skipped — SHOW FUNCTIONS not available here: {type(e).__name__})")
 ```
 
 If `ImportError` on `pyrx` after `%pip` and restart → this release likely lacks Lightweight. Use Heavyweight (`1-install/install-heavy.md`) on classic x86 or upgrade GeoBrix.

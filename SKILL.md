@@ -53,6 +53,31 @@ weigh these signals and, if the source looks like a single small scene, ask the 
 committing to GeoBrix. See `references/functions.md` for the processing functions available
 on the `tile` column (spectral indices, clip, reproject, mosaic, H3/zonal aggregation).
 
+#### B1. Small-AOI escape — a large source does NOT force GeoBrix
+
+**A large source file does not, by itself, make this a distributed job.** If the *entire
+deliverable* is **one small area-of-interest (AOI) from a large raster, produced once** —
+"just show me London from this global scene", "extract this bbox to a small GeoTIFF" — then the
+work is single-node even though the source is 10.8 GB. A **windowed read** (`rasterio` `Window`
+/ `gdal_translate -projwin`) pulls only the bytes overlapping the AOI (on a striped source, just
+the strips spanning those rows — often a few hundred MB of a multi-GB file) and skips the rest.
+This is the right tool: it's the §B single-node case, and reading source bytes to render an AOI
+is the **allowed final-step-visualization / metadata exception** (see Substitution policy).
+
+Route to a **windowed read (single-node), NOT GeoBrix retile**, when ALL hold:
+- the output is a **single small AOI** (one bbox / one boundary), and
+- it's **one-off** (a look, a figure, a small extract) — not a repeated/pipeline job, and
+- there is **no whole-raster processing** in the deliverable (no global stats, no all-tiles
+  transform, no raster→H3 over the full extent).
+
+Surface it: *"The source is large but you only want <AOI>, once — I'll do a windowed read on a
+single node (GeoBrix's distributed retile isn't needed for one small window)."*
+
+⚠️ **This is NOT a license to skip retile by clipping.** If the job processes the whole raster
+(or many AOIs, or feeds a pipeline) and merely *ends* with a clip, that's a distributed GeoBrix
+job — the Phase 2a "route on **input** size, don't reason about output size" rule applies and
+retile-and-persist is mandatory. The escape is only for when the small AOI **is the whole job**.
+
 > A worked "patterns for `rst_*` processing functions" section is deferred until needed —
 > this skill's current focus is **ingestion by format**. The processing functions are
 > catalogued in `references/functions.md`; add worked patterns there when the need arises.
@@ -101,7 +126,15 @@ Before install, pick **tier** then **compute**. Source: [Choosing an Execution T
 
 **Route to Lightweight** for typical RasterX work this skill covers when none of the above apply: GeoTIFF/COG read, metadata, `rst_*` analytics (stats, clip, reproject, NDVI, H3, zonal stats), and SMALL/MEDIUM size routing.
 
-**Compute routing:**
+> **Heads-up:** Light can OOM on a *whole-raster* read of a very large single GeoTIFF (esp.
+> internally striped). Not auto-gated — try Light by default; if a large whole-raster read
+> struggles, **prefer switching to Heavy** (one pass, and faster than converting to COG first) —
+> switching to Heavy just means attaching a classic x86 cluster. COG-convert-on-Light is a fallback
+> only when a classic cluster genuinely can't be obtained — **being *currently* on Serverless is NOT
+> "locked"; don't assume it.** Details + rationale: `references/2-ingest/2c-large-raster-retile.md`.
+> Surface it, user decides.
+>
+> Heavy needing **manual setup you can't automate** (starting/switching a classic cluster, JAR/init-script install) is **not** a reason to retreat to a path you've already seen fail this session — never re-run a read that already OOM'd "to check." Present the setup-vs-known-failure tradeoff and let the user act.
 
 | Tier | Default compute | Fallback |
 |---|---|---|
@@ -211,12 +244,21 @@ except ImportError:
         print(f"❌ GeoBrix not installed: {e}")
 
 if rx is not None:
+    # The Python API surface (dir(rx)) is the source of truth — pure Python, always works.
     api_names = sorted(name for name in dir(rx) if not name.startswith("_"))
     rst_fns = [n for n in api_names if n.startswith("rst_")]
-    n_sql = spark.sql("SHOW FUNCTIONS LIKE '*rst_*'").count()
     print(f"✅ GeoBrix {TIER}: {len(rst_fns)} rst_* functions")
     print(f"   Readers: {GEOTIFF_READER}, {GENERIC_READER}")
-    print(f"   SQL functions (matching *rst_*): {n_sql}")
+
+    # OPTIONAL diagnostic: count SQL-registered functions. `SHOW FUNCTIONS` can throw a
+    # SQL parse error on some Serverless / Spark Connect runtimes, so it MUST NOT be able to
+    # break the bootstrap. Wrap it; a failure here says nothing about whether rx is usable.
+    try:
+        n_sql = spark.sql("SHOW FUNCTIONS").filter("function LIKE '%rst_%'").count()
+        print(f"   SQL functions (matching rst_): {n_sql}")
+    except Exception as e:
+        print(f"   (SQL function count skipped — SHOW FUNCTIONS not available here: {type(e).__name__})")
+
     print("\nrx API:", ", ".join(api_names))
 ```
 
@@ -316,6 +358,13 @@ the source read; do not reason that the *output* will be small (routing is on **
 When unsure between the two branches, choose LARGE. The runnable threshold check, tile-size
 tuning, and the full anti-pattern list live in `references/2-ingest/2c-large-raster-retile.md`.
 
+> **One exception, decided at §B1 — not here.** If the *entire deliverable* is a single small
+> AOI produced once (one bbox/boundary, no whole-raster processing), that was routed to a
+> single-node **windowed read** back at §B1, before this LARGE branch — it never reaches Phase
+> 2a's retile path. The "don't reason about output size" rule above applies to *distributed
+> GeoBrix jobs that merely end with a clip* — it does NOT force retile onto a genuine one-off
+> AOI extract. If you're here in Phase 2a, the §B1 escape did not apply and retile IS mandatory.
+
 **After Stage 1 runs, look at its output — it drives everything downstream.** Note the detected format(s): if it prints `['unknown']` (e.g. extension-less files), inspect the source manually before assuming the single-grid path — a NetCDF/GRIB file without an extension would otherwise skip the SUBDATASET branch and be byte-routed incorrectly.
 
 #### Hard rules — non-negotiable, no creative interpretation
@@ -332,22 +381,49 @@ tuning, and the full anti-pattern list live in `references/2-ingest/2c-large-ras
 
 Pick the reader based on the source extension:
 
+Default to the **Lightweight** readers (`gtiff_gbx` / `raster_gbx`) — this is the recommended path
+(Serverless-friendly, no JAR/init-script). Use the Phase 1 `GEOTIFF_READER`/`GENERIC_READER`
+variables so the tier chosen at bootstrap flows through; the literal names below are the Light case.
+
 ```python
 ext = source_path.lower().rsplit(".", 1)[-1]
 
 if ext in ("tif", "tiff"):
-    rasters = spark.read.format("gtiff_gdal").load(source_path)   # GeoTIFF / COG
+    rasters = spark.read.format(GEOTIFF_READER).load(source_path)   # GeoTIFF / COG — Light: gtiff_gbx
 else:
-    # Other single-grid GDAL formats — auto-detect, or set driverName explicitly
+    # Other single-grid formats — auto-detect, or set driverName explicitly
     # (e.g. "JP2OpenJPEG" for .jp2, "HFA" for .img).
     # NOTE: NetCDF/GRIB are NOT read here — they route to Phase 2d.
-    rasters = spark.read.format("gdal").load(source_path)
+    rasters = spark.read.format(GENERIC_READER).load(source_path)   # Light: raster_gbx
 
 # Optional: split per-file at a target size. Add only if files are several hundred MB+.
 # .option("sizeInMB", "32")
 ```
 
 The output has a `tile` column ready for RasterX functions. Proceed to Phase 3.
+
+##### Light on serverless: repartition to avoid OOM (before switching to Heavy)
+
+The Light reader (`gtiff_gbx`, rasterio-backed) has **more memory pressure than Heavy** (`gtiff_gdal`,
+native GDAL). On serverless, a large read/process can OOM where Heavy wouldn't — but the first fix
+is **repartition, not a tier switch.** Staying on Light + repartitioning is preferred to escalating
+to Heavy (keeps you on serverless / declarative pipelines).
+
+```python
+# Serverless respects repartition ONLY when given a number AND a column.
+# repartition(n) alone is IGNORED on serverless — you must pass a partitioning column.
+rasters = (spark.read.format("gtiff_gbx").load(source_path)
+    .repartition(n, "source"))     # n ≈ number of source files is a reasonable starting count
+```
+
+- **Number + column is mandatory on serverless.** `repartition(n)` (number only) is silently ignored;
+  `repartition(n, col)` is respected. Use a column that fans the work out — `"source"` (per-file) is
+  the natural default for multi-file reads.
+- **`n ≈ #files`** is a sensible starting partition count for large multi-file datasets; tune from there.
+- **The heavy cost is the binary payload handling during conversion**, not the file looping — so
+  partitioning the payload work is what relieves the memory pressure.
+- **Readers auto-partition more intelligently than bare functions.** If you're OOMing while calling a
+  standalone `rx.*` function (not a reader), you own the partitioning — add the repartition hint yourself.
 
 #### Phase 2c. LARGE routing → retile-and-persist
 
@@ -373,9 +449,12 @@ If Phase 2a printed `ROUTING: SUBDATASET`, the byte-based size gate does **not**
 **Phase 3 is format-agnostic.** Phases 2b/2c/2d all converge on a `tile` column; from here the analytics are the same whether the source was a GeoTIFF, a retiled large scene, or a NetCDF reduced to GeoTIFFs. Register functions, then operate on the `tile` column with whatever operations the user's workflow needs. **None of the operations below are required** — pick the ones that fit. Many raster workflows have no clip step at all (global aggregation, reprojection, format conversion, mosaic). Don't assume "clip to a region" is the default just because it's a common example.
 
 ```python
-from databricks.labs.gbx.rasterx import functions as rx
+# Lightweight (default) — already set up in Phase 1:
+from databricks.labs.gbx.pyrx import functions as rx
 from pyspark.sql.functions import col, lit
 rx.register(spark)
+# Heavyweight equivalent (only if that's your installed tier):
+# from databricks.labs.gbx.rasterx import functions as rx
 
 # --- Examples (pick what's needed; not a required sequence) ---
 
@@ -440,6 +519,7 @@ Apply the same propose-and-confirm pattern wherever a table name is needed (`ret
 | Issue | Cause / Fix |
 |---|---|
 | `SHOW FUNCTIONS LIKE '*rst_*'` returns empty (but `dir(rx)` shows `rst_*`) | Registration didn't expose SQL functions — re-run `rx.register(spark)`; if `dir(rx)` is also empty, the init script didn't run (check cluster event log, verify `VOL_DIR` and Volume path) |
+| `SHOW FUNCTIONS LIKE '*rst_*'` throws `[PARSE_SYNTAX_ERROR] ... at or near ':'` | The bare `SHOW FUNCTIONS LIKE '...'` form fails to parse on some Serverless / Spark Connect runtimes. Use `spark.sql("SHOW FUNCTIONS").filter("function LIKE '%rst_%'").count()` instead. This is only a diagnostic — `dir(rx)` is the source of truth for the API, so it should never block the bootstrap (Phase 1d wraps it in try/except). |
 | `UnsatisfiedLinkError: libgdalalljni.so` | `.so` not copied to `/usr/lib/` — re-check init script |
 | `Driver not found` on read | Provide `driverName` option, or use a named reader (`gtiff_gdal`) |
 | Out-of-memory on large rasters | Increase `sizeInMB` split, or use `rx.rst_retile` to chunk |
@@ -469,12 +549,12 @@ Apply the same propose-and-confirm pattern wherever a table name is needed (`ret
 ### Example 1: NDVI from Sentinel-2 imagery
 User says: *"I have Sentinel-2 tiles in a Volume — compute NDVI and save to Delta"*
 
-Result: Skill scaffolds the read using `gtiff_gdal`, applies `rx.rst_ndvi(tile, red_band, nir_band)`, then writes a Delta table partitioned by date.
+Result: Skill scaffolds the read using `gtiff_gbx` (Lightweight default), applies `rx.rst_ndvi(tile, red_band, nir_band)`, then writes a Delta table partitioned by date.
 
 ### Example 2: Zonal statistics over administrative boundaries
 User says: *"Compute mean elevation per county from a DTM raster"*
 
-Result: Join raster tiles with county polygons via `rx.rst_clip`, then aggregate using `rx.rst_avg` per polygon. Output is a Delta table keyed by county_id.
+Result: Join raster tiles with county polygons via `rx.rst_clip`, then aggregate per polygon. Note `rx.rst_avg` (and `rst_min`/`max`/`median`/`pixelcount`) return **`ARRAY<DOUBLE>`, one value per band** — extract the band you want before a cross-row `F.avg`/`F.sum` (single-band → index the one band; multi-band → explode or index the meaningful band; don't blanket-assume `[0]`). See `references/3-process/analytics.md`. Output is a Delta table keyed by county_id.
 
 ### Example 3: Raster reprojection
 User says: *"My rasters are in mixed CRSes — normalize them to Web Mercator before joining"*

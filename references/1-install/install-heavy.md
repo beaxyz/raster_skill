@@ -309,6 +309,32 @@ databricks fs cp geobrix-gdal-init.sh \
 
 ## Step 4: Configure the cluster
 
+Only **one** thing is attached to the cluster itself: the **init script** (it installs
+the GDAL stack and copies the JAR to `/databricks/jars`). The **JAR is NOT a cluster
+library** — the init script places it. See Step 4·JAR below.
+
+The **GeoBrix Python wheel** (`databricks.labs.gbx.rasterx` bindings) is a *separate*
+decision — and the install method matters:
+
+> **Install the Python wheel with notebook-scoped `%pip`, NOT as a cluster library** (default recommendation).
+> As the first cell of your notebook:
+> ```python
+> %pip install "${volume_path}/geobrix-${geobrix_version}-py3-none-any.whl"
+> dbutils.library.restartPython()
+> ```
+> The GeoBrix docs' heavy page shows the wheel attached as a *cluster library* (Libraries →
+> Upload → Python Whl). That works on a healthy workspace, but it is **not required** — it's
+> the **same single wheel** the light tier installs with `%pip`. Prefer `%pip` because a
+> **cluster-library attach makes Databricks' repl setup call `HiveSessionResourceLoader.addJar`,
+> which initializes the (legacy) Hive metastore client.** On a workspace whose metastore is
+> **unreachable** (e.g. a legacy external HMS / RDS that clusters can't route to), that init
+> **times out and the cluster/repl fails at startup** with `Hive metastore initialization failed
+> … Failure starting repl`. `%pip` installs after the repl is up, so it never touches that path.
+> (Verified 2026-08-21 in fevm-geo-sme-emea: cluster-library attach → repl fails on metastore;
+> same wheel via `%pip` → `rx.register` gives 126 `rst_` fns and the heavy `gdal` read works.)
+
+### 4·Init script + JAR (required — attach to the cluster)
+
 Two paths — pick whichever fits the user's context:
 
 | Path | When |
@@ -324,11 +350,9 @@ In the cluster Edit page → Advanced Options:
 - Source: Volume
 - Path: `${volume_path}/geobrix-gdal-init.sh`
 
-**Libraries tab**
-- Click *Install New* → *Upload* → *Python Whl*
-- Select `geobrix-${geobrix_version}-py3-none-any.whl`
-
-Restart (or start) the cluster.
+The init script copies the JAR to `/databricks/jars` at startup, so **do not** add the
+JAR (or, per the note above, the wheel) as a cluster library. Restart (or start) the cluster,
+then `%pip install` the Python wheel from your notebook (note above).
 
 ## Step 5: Verify
 
@@ -338,11 +362,18 @@ In a notebook attached to the cluster:
 from databricks.labs.gbx.rasterx import functions as rx
 rx.register(spark)
 
-n = spark.sql("SHOW FUNCTIONS LIKE 'gbx_rst_*'").count()
-print(f"✅ GeoBrix installed: {n} raster functions registered.")
+# Confirm registration. Prefer the Python API surface (always works); the SQL count is a
+# secondary check wrapped so a SHOW FUNCTIONS parse error can't fail verification.
+rst_fns = [n for n in dir(rx) if n.startswith("rst_")]
+print(f"✅ GeoBrix installed: {len(rst_fns)} rst_* on the Python API.")
+try:
+    n = spark.sql("SHOW FUNCTIONS").filter("function LIKE '%gbx_rst_%'").count()
+    print(f"   SQL functions (matching gbx_rst_): {n}")
+except Exception as e:
+    print(f"   (SQL function count skipped — SHOW FUNCTIONS not available here: {type(e).__name__})")
 ```
 
-If `n > 0`, installation succeeded. Don't list the full function set — it's noisy and the count is enough to confirm install. Users who want the catalog can find it in `references/functions.md` or via `SHOW FUNCTIONS LIKE 'gbx_rst_*'` directly.
+If the Python API shows `rst_*` functions, installation succeeded. Don't list the full function set — it's noisy. Users who want the catalog can find it in `references/functions.md`.
 
 ## Automating with Databricks SDK (optional)
 
@@ -398,14 +429,15 @@ w.clusters.update(
     cluster=ClusterAttributes(init_scripts=existing_init_scripts),
 )
 
-# 3. Install the WHL (libraries API is additive, safe)
-w.libraries.install(
-    cluster_id=cluster_id,
-    libraries=[Library(whl=f"{volume_path}/geobrix-{geobrix_version}-py3-none-any.whl")],
-)
-
-# 4. Restart so init script runs
+# 3. Restart so the init script runs (installs GDAL + copies the JAR to /databricks/jars).
 w.clusters.restart_and_wait(cluster_id=cluster_id)
+
+# NOTE: do NOT install the GeoBrix Python wheel as a cluster library here (no
+# w.libraries.install(whl=...)). Install it notebook-scoped instead — first cell:
+#   %pip install "<volume_path>/geobrix-<version>-py3-none-any.whl"
+#   dbutils.library.restartPython()
+# A cluster-library attach triggers HiveSessionResourceLoader.addJar at repl setup, which
+# fails on workspaces with an unreachable Hive metastore (see the Step 4 note above).
 ```
 
 ### Fallback pattern — if `clusters.update()` isn't available

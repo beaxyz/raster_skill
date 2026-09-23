@@ -50,43 +50,122 @@ print(f"\nRouting decision: {routing}")
 | Driver OOM on metadata extraction | Catalog enumeration over many splits in a single call |
 | Downstream ops re-read the source TIFF | Without persisting, Spark recomputes the split for each transform |
 | Long tail on a few executors | `sizeInMB=16` splits are MB-bounded, not pixel-bounded — uneven tile shapes |
+| **Read OOMs at any `sizeInMB` (Light tier)** | **Source is internally STRIPED, not tiled** — see below |
+
+## If a large whole-raster read struggles on Light — your options
+
+A LARGE single-grid GeoTIFF that is internally **striped** (pixels stored row-by-row) can OOM
+the **Light** (`gtiff_gbx`, rasterio) reader on a whole-raster retile — the read materializes far
+more than the tile window. **Heavy** (`gtiff_gdal`, native GDAL) streams the same file fine.
+Observed on a 10.8 GB VIIRS scene (`block_shape=(1, 86401)`). This is **not auto-gated** — the
+skill lets you try Light by default; this section is what to reach for **if that read struggles**.
+
+Optional layout check (header-only, no pixel read — tells you *why* Light might struggle):
+```python
+import rasterio
+with rasterio.open(source_path) as src:
+    print(f"tiled={bool(src.profile.get('tiled', False))}, block_shape={src.block_shapes[0]}")
+    # (1, width) == striped (Light may OOM on a large whole read); (512,512) == tiled (fine)
+```
+
+**Three options — none mandatory; surface the tradeoff and let the user choose:**
+
+**Recommended: switch to Heavy.** For a one-off large striped read, Heavy is the faster, simpler
+route — and empirically the COG route is *slower*, not just heavier to explain. Here's why, by
+counting full-raster passes:
+
+- **Heavy** → `[read + retile + persist]` → Delta. **One pass**; native GDAL streams the strips.
+- **COG-on-Light** → `[full rewrite to COG]` → `[read COG + retile + persist]` → Delta. **Two passes** — everything Heavy does, *plus* a full single-node rewrite (+ overviews) first, to reach the **identical** Delta table.
+
+So COG-on-Light does strictly more work for the same result. Observed in practice: **the COG
+conversion alone often takes longer than Heavy's entire read.** Prefer Heavy.
+
+| Option | When it fits | Cost |
+|---|---|---|
+| **✅ Switch to Heavy (recommended)** | A classic x86 cluster is available or worth provisioning | Cluster setup + heavy install, then native GDAL reads the striped file directly — one pass, no rewrite. Fastest to the Delta result for a one-off. |
+| **COG-convert, stay Light (fallback)** | **Truly cannot get a classic x86 cluster** (org policy / no entitlement / no permission to create one), OR the COG itself will be reused across many jobs | Full-raster rewrite first (tens of minutes on ~10 GB — often *longer* than a Heavy read), then retile. Only sensible when Heavy is genuinely unavailable — in the retile flow the reusable artifact is the Delta table, not the COG, so the "reuse" amortization rarely applies here. |
+| **Just try Light as-is** | Source is tiled/COG, or not that large | No preprocessing — proceed to Step-by-step. Only the large-striped combination forces the choice above. |
+
+> ⚠️ **"Currently on Serverless" is NOT "Serverless-locked."** Being *attached* to a Serverless
+> cluster right now does not mean Heavy is unavailable — switching to Heavy just means
+> provisioning/attaching a **classic x86 cluster**, which is normally possible in the workspace.
+> Do NOT pick the COG fallback merely because the current compute is Serverless. Only choose it
+> if the user genuinely cannot obtain a classic cluster (policy/entitlement), or explicitly
+> prefers to stay on Serverless after seeing that Heavy is faster. When in doubt, **ask** — don't
+> assume locked.
+
+**User decides, but lean Heavy.** Surface it as: *"This large striped read struggles on Light. I'd
+recommend switching to Heavy — one pass, and faster than the COG route which needs a full rewrite
+first. Stay on Light + COG-convert only if you can't get a classic cluster. Which do you want?"*
+
+### COG-convert (the Light-tier workaround, if chosen)
+
+File→file **streaming** conversion (block-by-block, bounded memory — never loads the whole
+raster), via rio-cogeo (a GeoBrix `[light]` dep). NOTE: `rio_cogeo.cog_translate` on the **path**,
+not `rx.rst_cog_convert` — the latter needs a `tile` column, which means reading the striped file
+into a tile first (the very step that OOMs). This is **allowed preprocessing** (like the metadata
+header read): it only normalizes internal layout; GeoBrix still does all the distributed work after.
+
+```python
+import os
+from rio_cogeo.cogeo import cog_translate
+from rio_cogeo.profiles import cog_profiles
+
+cog_path = source_path.rsplit(".", 1)[0] + "_cog.tif"   # needs Volume space ~= source size
+if not os.path.exists(cog_path):
+    cog_translate(
+        source_path, cog_path,
+        cog_profiles.get("deflate"),
+        overview_resampling="average",
+        in_memory=False,               # STREAM — do not load the whole raster
+    )
+print(f"COG written: {cog_path}")
+
+# Then use cog_path as the source for the step-by-step below — now tiled, so the Light
+# reader's windowed reads are cheap and retile no longer OOMs.
+source_path = cog_path
+```
 
 ## Step-by-step
 
 ```python
 import math
 from pyspark.sql import functions as F
-from databricks.labs.gbx.rasterx import functions as rx
-rx.register(spark)
+# Reuse rx + TIER + GEOTIFF_READER/GENERIC_READER from Phase 1 — do NOT re-import.
+# (Phase 1 set: Light → pyrx, gtiff_gbx/raster_gbx; Heavy → rasterx, gtiff_gdal/gdal.)
+# If running this doc standalone, run the Phase 1 bootstrap first to define them.
 
 src_path = "${src_path}"   # single-grid raster: GeoTIFF/COG, .jp2, .img …
 retiled_table = "${catalog}.${schema}.retiled_raster"
 
-# 1. Read the raster — pick the GDAL driver from the extension. The reader splits the
-#    file by `sizeInMB` (default 16) so each row in `raster_df` represents one CHUNK,
-#    not the whole file.
+# 1. Read the raster with an explicit `sizeInMB` split.
+#    TESTED working value: sizeInMB="512" on a 10.8 GB GeoTIFF via gtiff_gdal (VIIRS notebook).
+#    Set it explicitly. (Do NOT add getNumPartitions()/assert checks — the working notebook
+#    proceeded fine reading this file with sizeInMB=512; a low partition count is not itself
+#    a failure. Other values may work but only 512 is verified.)
 #
-#    SINGLE-GRID formats only. COG is not a special case — it's a GeoTIFF and reads
-#    through `GTiff`. NetCDF/GRIB are NOT handled here (variables exposed as
-#    subdatasets, often no embedded CRS) — use the NetCDF example instead.
+#    SINGLE-GRID formats only. COG is not a special case — it's a GeoTIFF. NetCDF/GRIB are
+#    NOT handled here (variables exposed as subdatasets, often no embedded CRS) — use the
+#    NetCDF example instead.
 ext = src_path.lower().rsplit(".", 1)[-1]
-single_grid_drivers = {
-    "tif": "GTiff", "tiff": "GTiff",   # GeoTIFF / COG
-    "jp2": "JP2OpenJPEG",              # JPEG2000
-    "img": "HFA",                      # ERDAS IMAGINE
-}
 if ext in ("nc", "grib", "grib2"):
     raise ValueError(
         f".{ext} is a subdataset/multidimensional format — use the NetCDF example, "
         "not this single-grid retile pattern."
     )
-driver = single_grid_drivers.get(ext, "GTiff")  # unknown single-grid ext → default GTiff
 
-raster_df = (
-    spark.read.format("gdal")
-        .option("driverName", driver)
-        .load(src_path)
-)
+# Reader is tier-specific (values come from Phase 1):
+#   GeoTIFF/COG → GEOTIFF_READER  (Light: gtiff_gbx / Heavy: gtiff_gdal)
+#   other single-grid (.jp2/.img) → GENERIC_READER + explicit driver
+#     (Heavy `gdal` takes driverName; Light `raster_gbx` infers from extension)
+if ext in ("tif", "tiff"):
+    reader = spark.read.format(GEOTIFF_READER).option("sizeInMB", "512")
+else:
+    reader = spark.read.format(GENERIC_READER).option("sizeInMB", "512")
+    if TIER == "heavy":
+        driver = {"jp2": "JP2OpenJPEG", "img": "HFA"}.get(ext, "GTiff")
+        reader = reader.option("driverName", driver)
+raster_df = reader.load(src_path)
 
 # 2. Inspect TRUE source dimensions.
 #    ⚠️ CRITICAL: `rx.rst_width("tile")` on a single row returns the CHUNK's width,
@@ -166,18 +245,25 @@ print(f"Tile size: {tile_size} × {tile_size}, estimated ~{estimated_tiles} tile
 
 # 4. Retile + persist to Delta. The persist step is what makes downstream cheap —
 #    every later op reads the materialized tiles, not the giant TIFF.
+#
+#    This example uses the PYTHON column API throughout — keep the whole workflow on one surface
+#    (see the generator rule in functions.md). TESTED (Heavy, VIIRS notebook): rx.rst_retile in
+#    withColumn returns an ARRAY<tile> column; persist it directly — no explode, no LATERAL.
 retiled_df = raster_df.withColumn(
     "retiled", rx.rst_retile("tile", F.lit(tile_size), F.lit(tile_size))
 )
 retiled_df.write.mode("overwrite").saveAsTable(retiled_table)
-
-# 5. Read back from the persisted table for ALL downstream work
-tiles = (
-    spark.read.table(retiled_table)
-    .drop("tile")
-    .withColumnRenamed("retiled", "tile")
-)
+tiles = spark.read.table(retiled_table)
 ```
+
+> **Tested on Heavy** — Python column API (`withColumn` + `saveAsTable`, no explode/LATERAL, VIIRS
+> notebook). This example is Python end-to-end; **keep it consistent on one surface.** If the user
+> prefers **SQL**, swap the *entire* workflow to it — `LATERAL gbx_rst_retile(tile, w, h)` — after
+> confirming `register(spark)` made the name resolvable (on our cluster it did not; see the SQL
+> note in `functions.md`). **Light retile is not verified** — Python generator call raises
+> `NotImplementedError`, and the SQL `LATERAL` path needs a working `register(spark)` (see
+> `todo.md` Part 8). Other generators (`rst_maketiles`, `rst_tooverlappingtiles`,
+> `rst_separatebands`, `rst_h3_tessellate`) share the same base but aren't tested here — verify first.
 
 ## Tuning tile size
 
@@ -209,12 +295,12 @@ retile-and-persist exists to prevent. There is no approved LARGE alternative.
 
 | Anti-pattern | Why it's wrong |
 |---|---|
-| `spark.read.format("gtiff_gdal").load(huge_file)` | Reads the giant file, often multiple times. The MB-bounded split is not a substitute for retile-and-persist. |
+| `spark.read.format(GEOTIFF_READER).load(huge_file)` (i.e. `gtiff_gbx` Light / `gtiff_gdal` Heavy) | Reads the giant file, often multiple times. The MB-bounded split is not a substitute for retile-and-persist. |
 | `SELECT * FROM rst_maketiles('{huge_file}', ...)` as the ingest step | `rst_maketiles` is a **generator** (build tiles from an extent + grid definition), not a file-ingest function. Using it to ingest a TIFF is either a misuse or a workaround for the size-check gate. Use the prescribed read pattern (small/medium) or retile-and-persist (large). |
 | `rst_fromfile(huge_file)` as the entry point | Same family as the SQL TVF above — a "direct constructor" that bypasses the size-check gate. Allowed only after Phase 2a routes the source as SMALL/MEDIUM. |
 | Read source twice (e.g. once for metadata, once for clipping) | Every downstream op re-pays the GDAL split cost. After Phase 2a, the next source read must be the one that persists to Delta. |
 | Read source → filter tiles by `rst_boundingbox` ∩ target bbox → clip survivors → merge | Still reads the giant source on every run. The "smart spatial filter" doesn't help; the cost is in the read, not the clip. Retile-and-persist instead. |
 | `rst_merge_agg` to a single tile before downstream work | Kills parallelism. Keep tiles separate; only merge if the final output format requires a single raster. |
-| `.write.format("gtiff_gdal").save(volume_path)` | `gtiff_gdal` is a **reader**, not a writer. This call does not produce a usable GTiff file. Persist as Delta tables; if you need a GTiff file artifact, extract `rst_asformat("tile", "GTiff")` and write the bytes via a different mechanism (e.g., `dbutils.fs.put` on the binary content). |
+| `.write.format(GEOTIFF_READER).save(volume_path)` (`gtiff_gbx`/`gtiff_gdal`) | The GeoTIFF reader is a **reader**, not a writer. This call does not produce a usable GTiff file. Persist as Delta tables; if you need a GTiff file artifact, extract `rst_asformat("tile", "GTiff")` and write the bytes via a different mechanism (e.g., `dbutils.fs.put` on the binary content). |
 | Picking `sizeInMB` "to make a large file manageable" | `sizeInMB` is an MB-bounded read-time split. It does not solve the underlying "read this giant file many times" problem. Use retile-and-persist. |
 | `rx.read_raster(...)`, `rx.load_tiff(...)`, `rx.from_path(...)`, or any other invented `rx.*` reader | These do NOT exist. Hallucinated function names. Raster ingestion is always via `spark.read.format(...)` per Phase 2b/2c. Check the `api_names` list from Phase 1 before calling any unfamiliar `rx.*` function. |

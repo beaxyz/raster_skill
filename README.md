@@ -70,7 +70,7 @@ Full routing rules → `SKILL.md` → **Execution tier selection**.
 2. **Substitution policy** — if GeoBrix is not installed: recommend tier, ask user (a) Light / (b) Heavy / (c) fallback, wait for choice
 3. **Workflow**
    - **Phase 1** — detect compute, bootstrap GeoBrix
-   - **Phase 2a** — mandatory size check (before any read)
+   - **Phase 2a** — mandatory size check: Stage 1 (universal — format + size → is GeoBrix worth it?) then Stage 2 (single-grid → LARGE vs SMALL/MEDIUM routing)
    - **Phase 2b / 2c / 2d** — read path by format and size (standard / large GeoTIFF / NetCDF-GRIB)
    - **Phase 3** — analytics on the `tile` column (`rst_*`)
    - **Phase 4** — persist to Delta in Unity Catalog

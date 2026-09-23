@@ -93,6 +93,45 @@ Authoritative API reference: https://databrickslabs.github.io/geobrix/docs/api/r
 | `rst_tooverlappingtiles(tile, width, height, overlap)` | Tile with overlap (for edge-aware ops, and to give a coarse grid enough cells before H3). Four args: e.g. `rx.rst_tooverlappingtiles("tile", F.lit(32), F.lit(32), F.lit(0))`. |
 | `rst_h3_tessellate(tile, resolution)` | Tessellate raster into H3 cells |
 
+> ### ⚠️ Generators (fan-out): pick ONE surface and keep every example consistent on it
+>
+> GeoBrix exposes two call surfaces — **Python column API** (`rx.rst_*`) and **SQL** (`gbx_rst_*`).
+> Both are valid. **The rule for this skill's examples: choose one surface and stay on it for the
+> WHOLE workflow — never mix them within an example.** Default the examples to the **Python column
+> API** (it's what we've tested, and it doesn't depend on SQL registration).
+>
+> **Default (Python column API) — TESTED on Heavy (VIIRS notebook):**
+> ```python
+> retiled_df = raster_df.withColumn("retiled", rx.rst_retile("tile", F.lit(4096), F.lit(4096)))
+> retiled_df.write.mode("overwrite").saveAsTable(retiled_table)   # returns an ARRAY<tile> column; persists directly
+> ```
+> No `explode`, no `LATERAL`. `explode()` only if you want one row per tile downstream.
+>
+> **SQL alternative (offer to the user if they prefer SQL) — then swap the ENTIRE workflow to SQL,
+> not just one step.** SQL uses the `gbx_`-prefixed name and the `LATERAL` form for generators:
+> ```sql
+> -- Python  rx.rst_retile(tile, w, h)   ⇄   SQL  LATERAL gbx_rst_retile(tile, w, h)
+> SELECT s.source, t.* FROM src s, LATERAL gbx_rst_retile(s.tile, 4096, 4096) t
+> ```
+> Python↔SQL name mapping: `rx.<name>(...)` ⇄ `gbx_<name>(...)`. Full catalog above / at
+> https://databrickslabs.github.io/geobrix/docs/api/raster-functions.
+> **Prerequisite for the SQL surface:** the `gbx_rst_*` name must be registered in the session via
+> `register(spark)`. On our cluster this did NOT resolve (`gbx_rst_retile` →
+> `UNRESOLVABLE_TABLE_VALUED_FUNCTION`) — so if a user chooses SQL, first confirm the name resolves
+> (`spark.sql("SHOW FUNCTIONS").filter("function LIKE '%rst_%'")`) before building the SQL workflow.
+>
+> **What's verified vs. not:**
+>
+> | | Python `rx.rst_*` | SQL `gbx_rst_*` |
+> |---|---|---|
+> | **Heavy** | ✅ tested (`withColumn`, array column) | exists (JAR-registered); our call didn't resolve — confirm registration before use |
+> | **Light** | generators **raise `NotImplementedError`** (observed) → use the SQL surface | needs a successful `register(spark)`; unverified here (see `todo.md` Part 8) |
+>
+> **Notes:**
+> - **Consistency is the rule, not Python-vs-SQL.** Either surface is fine; just don't half-swap an example.
+> - Non-generator functions (stats, clip, transform, NDVI…) are plain column/SQL expressions on both tiers — this note is only about the fan-out generators (`rst_retile`, `rst_maketiles`, `rst_tooverlappingtiles`, `rst_separatebands`, `rst_h3_tessellate`, `rst_polygonize`).
+> - **Tested for `rst_retile` only.** Other generators share the same base but their exact form is not verified here — confirm before relying on it.
+
 ## H3 grid aggregation
 
 Aggregate raster pixel values to H3 hex cells:
@@ -138,6 +177,6 @@ For `spark.read.format("gdal")` or named readers (`gtiff_gdal`, etc.):
 
 ## Notes
 
-- Functions are also callable directly in Spark SQL, but the prefix is version-dependent (`gbx_rst_*` per docs, `rst_*` on some installs). Verify with `SHOW FUNCTIONS LIKE '*rst_*'`, then call e.g. `SELECT <prefix>rst_width(tile) FROM rasters`
+- Functions are also callable directly in Spark SQL, but the prefix is version-dependent (`gbx_rst_*` per docs, `rst_*` on some installs). Verify with `spark.sql("SHOW FUNCTIONS").filter("function LIKE '%rst_%'")` (the bare `SHOW FUNCTIONS LIKE '*rst_*'` form throws a SQL parse error on some Serverless / Spark Connect runtimes — filter the result instead), then call e.g. `SELECT <prefix>rst_width(tile) FROM rasters`
 - After ingestion via vector readers (`*_ogr`), output uses `geom_0` / `geom_0_srid` / `geom_0_srid_proj` columns (or `shape*` / `SHAPE*` depending on the reader). Convert to native UC `GEOMETRY`/`GEOGRAPHY` types as a downstream step if needed
 - For functions not listed here, check the latest API at https://databrickslabs.github.io/geobrix/docs/packages/rasterx
